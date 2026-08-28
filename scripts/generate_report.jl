@@ -13,6 +13,10 @@ using Base64
 
 # ---------------------------------------------------------------------------
 # 1. Data (mirrors notebooks/polymer_pe_pp_scheduling.jl)
+#
+# PE and PP run on physically separate trains (different reactor/catalyst
+# technology), so this is two independent single-line problems solved in
+# parallel, not one shared line that switches families.
 # ---------------------------------------------------------------------------
 
 family = Dict(
@@ -41,104 +45,116 @@ orders = [
     (id = 7, grade = "PP-Homo-1100", qty = 110.0, due = 110.0, weight = 1.5),
 ]
 n = length(orders)
-proc_time = [orders[i].qty / production_rate[orders[i].grade] for i in 1:n]
+pe_orders = filter(o -> family[o.grade] == :PE, orders)
+pp_orders = filter(o -> family[o.grade] == :PP, orders)
 
-function changeover_time(gi::String, gj::String)
-    if gi == gj
-        0.5
-    elseif family[gi] == family[gj]
-        2.5
-    else
-        7.0
-    end
-end
-s = [changeover_time(orders[i].grade, orders[j].grade) for i in 1:n, j in 1:n]
+# Changeover time (hours) within a train: only ever between grades of the
+# SAME family, since PE and PP never share equipment.
+changeover_time(gi::String, gj::String) = gi == gj ? 0.5 : 2.5
 startup_time = 1.0
 
 changeover_cost_per_hour = 450.0
 tardiness_cost_per_hour  = 300.0
 
 # ---------------------------------------------------------------------------
-# 2. MILP (identical formulation to the notebook)
+# 2. Single-train sequencing MILP (identical formulation to the notebook),
+#    applied independently to each train's orders
 # ---------------------------------------------------------------------------
 
-model = Model(HiGHS.Optimizer)
-set_silent(model)
+function schedule_line(line_orders)
+    m = length(line_orders)
+    pt = [o.qty / production_rate[o.grade] for o in line_orders]
+    sm = [changeover_time(line_orders[i].grade, line_orders[j].grade) for i in 1:m, j in 1:m]
 
-N  = 1:n
-N0 = 0:n
+    model = Model(HiGHS.Optimizer)
+    set_silent(model)
 
-@variable(model, x[i in N0, j in N0; i != j && j != 0], Bin)
-@variable(model, C[N] >= 0)
-@variable(model, T[N] >= 0)
+    M  = 1:m
+    M0 = 0:m
 
-@constraint(model, sum(x[0, j] for j in N) == 1)
-@constraint(model, [j in N], sum(x[i, j] for i in N0 if i != j) == 1)
-@constraint(model, [i in N], sum(x[i, j] for j in N if j != i) <= 1)
+    @variable(model, x[i in M0, j in M0; i != j && j != 0], Bin)
+    @variable(model, C[M] >= 0)
+    @variable(model, T[M] >= 0)
 
-bigM = startup_time + sum(proc_time) + sum(maximum(s[i, :]) for i in N)
+    @constraint(model, sum(x[0, j] for j in M) == 1)
+    @constraint(model, [j in M], sum(x[i, j] for i in M0 if i != j) == 1)
+    @constraint(model, [i in M], sum(x[i, j] for j in M if j != i) <= 1)
 
-@constraint(model, [j in N], C[j] >= startup_time + proc_time[j] - bigM * (1 - x[0, j]))
-@constraint(model, [i in N, j in N; i != j],
-    C[j] >= C[i] + s[i, j] + proc_time[j] - bigM * (1 - x[i, j]))
-@constraint(model, [i in N], T[i] >= C[i] - orders[i].due)
+    bigM = startup_time + sum(pt) + sum(maximum(sm[i, :]) for i in M)
 
-@objective(model, Min,
-    changeover_cost_per_hour * sum(s[i, j] * x[i, j] for i in N, j in N if i != j) +
-    changeover_cost_per_hour * sum(startup_time * x[0, j] for j in N) +
-    tardiness_cost_per_hour * sum(orders[i].weight * T[i] for i in N)
-)
+    @constraint(model, [j in M], C[j] >= startup_time + pt[j] - bigM * (1 - x[0, j]))
+    @constraint(model, [i in M, j in M; i != j],
+        C[j] >= C[i] + sm[i, j] + pt[j] - bigM * (1 - x[i, j]))
+    @constraint(model, [i in M], T[i] >= C[i] - line_orders[i].due)
 
-optimize!(model)
-@assert termination_status(model) == MOI.OPTIMAL "Solver did not reach optimality"
+    @objective(model, Min,
+        changeover_cost_per_hour * sum(sm[i, j] * x[i, j] for i in M, j in M if i != j) +
+        changeover_cost_per_hour * sum(startup_time * x[0, j] for j in M) +
+        tardiness_cost_per_hour * sum(line_orders[i].weight * T[i] for i in M)
+    )
 
-xval = value.(x)
-succ = Dict{Int, Int}()
-first_order = 0
-for j in N
-    if xval[0, j] > 0.5
-        global first_order = j
+    optimize!(model)
+    @assert termination_status(model) == MOI.OPTIMAL "Solver did not reach optimality"
+
+    xval = value.(x)
+    succ = Dict{Int, Int}()
+    first_order = 0
+    for j in M
+        xval[0, j] > 0.5 && (first_order = j)
     end
-end
-for i in N, j in N
-    if i != j && xval[i, j] > 0.5
-        succ[i] = j
+    for i in M, j in M
+        i != j && xval[i, j] > 0.5 && (succ[i] = j)
     end
-end
-seq = Int[first_order]
-let cur = first_order
-    global seq
-    while haskey(succ, cur)
-        cur = succ[cur]
-        push!(seq, cur)
+    seq = Int[first_order]
+    let cur = first_order
+        while haskey(succ, cur)
+            cur = succ[cur]
+            push!(seq, cur)
+        end
     end
+
+    (seq = seq, pt = pt, C = value.(C), T = value.(T), cost = objective_value(model))
 end
+
+pe = schedule_line(pe_orders)
+pp = schedule_line(pp_orders)
+
+total_cost = pe.cost + pp.cost
+makespan_pe = maximum(pe.C)
+makespan_pp = maximum(pp.C)
+overall_makespan = max(makespan_pe, makespan_pp)
+total_tardy_h = sum(pe.T) + sum(pp.T)
+n_tardy_orders = count(>(1e-6), vcat(pe.T, pp.T))
 
 # ---------------------------------------------------------------------------
-# 3. Gantt chart -> PNG -> base64 (so the HTML needs zero external requests)
+# 3. Gantt chart (two rows, one per train, both starting at t = 0) -> PNG ->
+#    base64 (so the HTML needs zero external requests)
 # ---------------------------------------------------------------------------
 
 family_color = Dict(:PE => RGB(0.20, 0.45, 0.85), :PP => RGB(0.90, 0.55, 0.10))
 
 gantt = plot(
-    size = (1000, 360), dpi = 150,
-    xlabel = "Time (h)", ylabel = "", yticks = :none, ylims = (0, 2),
-    legend = :outertop, legendcolumns = 2, framestyle = :box,
-    title = "Single-line production campaign",
+    size = (1000, 380), dpi = 150,
+    xlabel = "Time (h)", ylabel = "", yticks = ([1, 2], ["PP train", "PE train"]),
+    ylims = (0, 3), legend = :outertop, legendcolumns = 2, framestyle = :box,
+    title = "Two dedicated production trains (running in parallel)",
 )
 seen = Set{Symbol}()
-for i in seq
-    start_t = value(C[i]) - proc_time[i]
-    fam = family[orders[i].grade]
-    lbl = fam in seen ? "" : String(fam)
-    push!(seen, fam)
-    plot!(gantt, Shape([start_t, value(C[i]), value(C[i]), start_t], [0.4, 0.4, 1.6, 1.6]),
-          color = family_color[fam], linecolor = :black, label = lbl)
-    annotate!(gantt, (start_t + value(C[i])) / 2, 1.0,
-              text(string(orders[i].grade, "\n#", orders[i].id), 7, :white, :center))
-    due_color = value(T[i]) > 1e-6 ? :red : :black
-    scatter!(gantt, [orders[i].due], [1.85], marker = :dtriangle, markersize = 6,
-             color = due_color, label = "")
+for (res, os, ypos) in ((pe, pe_orders, 2), (pp, pp_orders, 1))
+    for i in res.seq
+        start_t = res.C[i] - res.pt[i]
+        fam = family[os[i].grade]
+        lbl = fam in seen ? "" : String(fam)
+        push!(seen, fam)
+        plot!(gantt, Shape([start_t, res.C[i], res.C[i], start_t],
+                            [ypos - 0.35, ypos - 0.35, ypos + 0.35, ypos + 0.35]),
+              color = family_color[fam], linecolor = :black, label = lbl)
+        annotate!(gantt, (start_t + res.C[i]) / 2, ypos,
+                  text(string(os[i].grade, "\n#", os[i].id), 7, :white, :center))
+        due_color = res.T[i] > 1e-6 ? :red : :black
+        scatter!(gantt, [os[i].due], [ypos + 0.42], marker = :dtriangle, markersize = 6,
+                 color = due_color, label = "")
+    end
 end
 
 gantt_png_path = tempname() * ".png"
@@ -147,34 +163,31 @@ gantt_b64 = base64encode(read(gantt_png_path))
 rm(gantt_png_path)
 
 # ---------------------------------------------------------------------------
-# 4. KPIs and the results table
+# 4. Results table rows
 # ---------------------------------------------------------------------------
 
-total_changeover_h = sum(s[i, j] * xval[i, j] for i in N, j in N if i != j) +
-                      sum(startup_time * xval[0, j] for j in N)
-total_tardy_h = sum(value.(T))
-n_tardy_orders = count(i -> value(T[i]) > 1e-6, N)
-makespan = maximum(value.(C))
-total_cost = objective_value(model)
-
-rows_html = IOBuffer()
-for i in seq
-    start_t = value(C[i]) - proc_time[i]
-    tardy = value(T[i])
-    tardy_str = tardy > 1e-6 ? @sprintf("%.1f h late", tardy) : "on time"
-    tardy_class = tardy > 1e-6 ? " class=\"tardy\"" : ""
-    println(rows_html, """
-    <tr$tardy_class>
-      <td>$(orders[i].id)</td>
-      <td>$(orders[i].grade)</td>
-      <td>$(String(family[orders[i].grade]))</td>
-      <td>$(@sprintf("%.0f", orders[i].qty))</td>
-      <td>$(@sprintf("%.1f", start_t))</td>
-      <td>$(@sprintf("%.1f", value(C[i])))</td>
-      <td>$(@sprintf("%.1f", orders[i].due))</td>
-      <td>$tardy_str</td>
-    </tr>""")
+function rows_for(res, os, train_label)
+    io = IOBuffer()
+    for i in res.seq
+        start_t = res.C[i] - res.pt[i]
+        tardy = res.T[i]
+        tardy_str = tardy > 1e-6 ? @sprintf("%.1f h late", tardy) : "on time"
+        tardy_class = tardy > 1e-6 ? " class=\"tardy\"" : ""
+        println(io, """
+        <tr$tardy_class>
+          <td>$train_label</td>
+          <td>$(os[i].id)</td>
+          <td>$(os[i].grade)</td>
+          <td>$(@sprintf("%.0f", os[i].qty))</td>
+          <td>$(@sprintf("%.1f", start_t))</td>
+          <td>$(@sprintf("%.1f", res.C[i]))</td>
+          <td>$(@sprintf("%.1f", os[i].due))</td>
+          <td>$tardy_str</td>
+        </tr>""")
+    end
+    String(take!(io))
 end
+rows_html = rows_for(pe, pe_orders, "PE") * rows_for(pp, pp_orders, "PP")
 
 # ---------------------------------------------------------------------------
 # 5. Assemble the self-contained HTML report
@@ -185,7 +198,7 @@ html = """
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Polymer Plant Scheduling — PE &amp; PP Production Campaigns</title>
+<title>Polymer Plant Scheduling — Dedicated PE &amp; PP Production Trains</title>
 <style>
   @page { size: A4; margin: 20mm 16mm; }
   * { box-sizing: border-box; }
@@ -233,60 +246,70 @@ html = """
 </head>
 <body>
 
-<h1>Polymer Plant Scheduling — PE &amp; PP Production Campaigns</h1>
+<h1>Polymer Plant Scheduling — Dedicated PE &amp; PP Production Trains</h1>
 <p class="subtitle">Manufacturing scheduling case study &middot; Julia + JuMP + HiGHS &middot; companion to <code>notebooks/polymer_pe_pp_scheduling.jl</code></p>
 
 <p>
-This report documents a <strong>production scheduling model</strong> for a single
-compounding / extrusion line that manufactures several grades of
-<strong>polyethylene (PE)</strong> and <strong>polypropylene (PP)</strong>.
-Switching the line between grades — and especially between the PE and PP
-<strong>families</strong> — costs time and money: purging, catalyst/additive
-changes, and off-spec transition material. The model below decides the order
-in which to run a set of confirmed orders so as to minimize total changeover
-cost plus tardiness cost. It is a mixed-integer linear program (MILP), built
-with <a href="https://jump.dev">JuMP.jl</a> and solved with the open-source
+This report documents a <strong>production scheduling model</strong> for a
+polymer plant that manufactures several grades of <strong>polyethylene
+(PE)</strong> and <strong>polypropylene (PP)</strong>. PE and PP are made on
+<strong>physically separate trains</strong>: different reactor technology
+and catalyst systems (e.g. gas-phase/slurry PE reactors vs.
+Ziegler-Natta/metallocene PP reactors) mean a PE line can never run a PP
+grade or vice versa. So this is really <strong>two independent single-line
+scheduling problems, running in parallel</strong> — one per train.
+</p>
+<p>
+Within a train, switching between grades still costs time and money:
+color/additive changes and partial purges. The scheduler below decides the
+order in which each train runs its confirmed orders so as to minimize total
+changeover cost plus tardiness cost, per train. Each train's sub-problem is
+a mixed-integer linear program (MILP), built with
+<a href="https://jump.dev">JuMP.jl</a> and solved with the open-source
 <a href="https://highs.dev">HiGHS</a> solver.
 </p>
 
 <h2>1. Plant data: grades, families, and orders</h2>
 <p>
-The line currently has <strong>$(n) confirmed orders</strong> across
-<strong>5 grades</strong>: three PE grades (HDPE, LLDPE, LDPE) and two PP
-grades (homopolymer and copolymer). Each order has a quantity, a production
-rate on this line, and a customer due date (in hours from the scheduling
-horizon start, t&nbsp;=&nbsp;0).
+The plant has <strong>$(n) confirmed orders</strong> across
+<strong>5 grades</strong>: three PE grades (HDPE, LLDPE, LDPE) on the PE
+train, and two PP grades (homopolymer and copolymer) on the PP train. Each
+order has a quantity, a production rate on its train, and a customer due
+date (in hours from the scheduling horizon start, t&nbsp;=&nbsp;0).
 </p>
 <table>
-<thead><tr><th>Order</th><th>Grade</th><th>Family</th><th>Qty (t)</th><th>Rate (t/h)</th><th>Due (h)</th><th>Weight</th></tr></thead>
+<thead><tr><th>Order</th><th>Grade</th><th>Train</th><th>Qty (t)</th><th>Rate (t/h)</th><th>Due (h)</th><th>Weight</th></tr></thead>
 <tbody>
 $(join(["<tr><td>$(o.id)</td><td>$(o.grade)</td><td>$(String(family[o.grade]))</td><td>$(@sprintf("%.0f", o.qty))</td><td>$(@sprintf("%.1f", production_rate[o.grade]))</td><td>$(@sprintf("%.0f", o.due))</td><td>$(o.weight)</td></tr>" for o in orders]))
 </tbody>
 </table>
 
-<h2>2. Sequence-dependent changeovers</h2>
+<h2>2. Sequence-dependent changeovers (within a train)</h2>
 <p>
-Because PE and PP require different catalysts and purge procedures, the
-changeover time depends on <em>what</em> the line just ran, not just on the
-next grade:
+Because a train only ever runs grades from one family, the only changeover
+decision is <em>within</em> that family:
 </p>
 <table>
 <thead><tr><th>Transition</th><th>Time (h)</th><th>Why</th></tr></thead>
 <tbody>
 <tr><td>Same grade repeated</td><td>0.5</td><td>housekeeping only</td></tr>
-<tr><td>Same family, different grade</td><td>2.5</td><td>color/additive change, partial purge</td></tr>
-<tr><td>PE &harr; PP family switch</td><td>7.0</td><td>full line/reactor purge + catalyst change</td></tr>
+<tr><td>Different grade, same family</td><td>2.5</td><td>color/additive change, partial purge</td></tr>
 </tbody>
 </table>
+<p class="note">
+There is no PE&harr;PP transition to model — that changeover never happens,
+because it would require re-equipping the whole train.
+</p>
 <p>Cost rates used in this run: changeover
 <strong>\$$(@sprintf("%.0f", changeover_cost_per_hour))/h</strong>, tardiness
 <strong>\$$(@sprintf("%.0f", tardiness_cost_per_hour))/h</strong> per unit
 order weight. (The companion Pluto notebook exposes both as live sliders.)</p>
 
-<h2>3. MILP formulation</h2>
+<h2>3. MILP formulation (applied once per train)</h2>
 <p>
-Node 0 is a dummy "line idle" start state; nodes 1..n are the orders. Binary
-variables x<sub>ij</sub> indicate that order j runs immediately after node i.
+Each train's orders are scheduled independently. Node 0 is a dummy "train
+idle" start state; nodes 1..m are that train's orders. Binary variables
+x<sub>ij</sub> indicate that order j runs immediately after node i.
 Continuous variables C<sub>i</sub> and T<sub>i</sub> are the completion time
 and tardiness of order i.
 </p>
@@ -302,58 +325,65 @@ subject to  sum_j x_0j = 1
 </pre>
 <p class="note">
 Completion times must strictly increase along any chain of active arcs, so
-this "big-M timing" formulation rules out sub-tours on its own — no separate
-subtour-elimination constraints (e.g. MTZ) are needed for a single open path.
-With $(n) orders the model has $(sum(1 for i in N0, j in N0 if i != j && j != 0)) binary
-variables and solves to global optimality with HiGHS in well under a second.
+this "big-M timing" formulation rules out sub-tours on its own — no
+separate subtour-elimination constraints (e.g. MTZ) are needed. The two
+trains' sub-problems share no variables, so solving them independently with
+HiGHS is exact, not a heuristic decomposition — both reach global optimality
+in well under a second.
 </p>
 
-<h2>4. Optimal campaign sequence</h2>
+<h2>4. Optimal campaign sequence, per train</h2>
 <table>
-<thead><tr><th>Order</th><th>Grade</th><th>Family</th><th>Qty (t)</th><th>Start (h)</th><th>End (h)</th><th>Due (h)</th><th>Status</th></tr></thead>
+<thead><tr><th>Train</th><th>Order</th><th>Grade</th><th>Qty (t)</th><th>Start (h)</th><th>End (h)</th><th>Due (h)</th><th>Status</th></tr></thead>
 <tbody>
-$(String(take!(rows_html)))
+$(rows_html)
 </tbody>
 </table>
 
 <h2>5. Gantt chart</h2>
-<img class="gantt" src="data:image/png;base64,$(gantt_b64)" alt="Gantt chart of the optimal production campaign">
+<img class="gantt" src="data:image/png;base64,$(gantt_b64)" alt="Gantt chart of the two parallel production trains">
 <p>
 Grade blocks are colored by polymer family (<span class="legend-pe">PE</span> vs.
 <span class="legend-pp">PP</span>); triangles mark each order's due date (red = missed).
-The optimizer clusters same-family grades together to avoid the expensive
-7-hour PE&harr;PP purge, trading a little lateness on lower-weight orders when
-that is cheaper than an extra family switch.
+Because the two trains never compete for the same equipment, they run
+<strong>simultaneously</strong>: overall makespan is the <em>slower</em> of
+the two trains, not the sum of both.
 </p>
 
 <h2>6. Key performance indicators</h2>
 <div class="kpi-grid">
-  <div class="kpi"><div class="label">Makespan</div><div class="value">$(@sprintf("%.1f", makespan)) h</div></div>
-  <div class="kpi"><div class="label">Changeover time</div><div class="value">$(@sprintf("%.1f", total_changeover_h)) h</div></div>
-  <div class="kpi"><div class="label">Tardiness</div><div class="value">$(@sprintf("%.1f", total_tardy_h)) h ($(n_tardy_orders) ord.)</div></div>
+  <div class="kpi"><div class="label">PE train makespan</div><div class="value">$(@sprintf("%.1f", makespan_pe)) h</div></div>
+  <div class="kpi"><div class="label">PP train makespan</div><div class="value">$(@sprintf("%.1f", makespan_pp)) h</div></div>
+  <div class="kpi"><div class="label">Overall makespan</div><div class="value">$(@sprintf("%.1f", overall_makespan)) h</div></div>
   <div class="kpi"><div class="label">Total cost</div><div class="value">\$$(@sprintf("%.0f", total_cost))</div></div>
 </div>
+<p>
+Tardiness: $(@sprintf("%.1f", total_tardy_h)) h across $(n_tardy_orders) of $(n) orders.
+PE train cost: \$$(@sprintf("%.0f", pe.cost)); PP train cost: \$$(@sprintf("%.0f", pp.cost)).
+</p>
 
 <h2>7. Discussion &amp; extensions</h2>
 <p>
-This single-line, deterministic model already captures the dominant
-economics of PE/PP campaign scheduling — family-driven changeovers and
-due-date pressure — while staying small enough to solve to global optimality
-in well under a second. Natural next steps for a production-grade version:
+Modeling PE and PP as two <strong>dedicated, parallel trains</strong> —
+rather than one shared line that pays a family-changeover penalty — matters
+economically: it removes a changeover that can never actually happen on
+real equipment, and it lets both product families progress at once instead
+of queueing behind each other. Natural next steps for a production-grade
+version:
 </p>
 <ul>
-  <li><strong>Multiple parallel lines</strong> — extend x to a 3-index x[i,j,line] and add line-capability restrictions (not every line can run every grade).</li>
+  <li><strong>More than one train per family</strong> — e.g. two PE lines with different capability sets; extend the model to a proper parallel-machine assignment problem within a family.</li>
   <li><strong>Minimum/maximum campaign length</strong> — avoid uneconomically short runs by bounding the number of consecutive orders of the same grade.</li>
-  <li><strong>Exact grade-pair changeover matrix</strong> — replace the family-level matrix with real historical purge times per ordered grade pair.</li>
-  <li><strong>Inventory &amp; storage costs</strong> — silo capacity limits often force a grade off the natural due-date order even when changeovers are cheap.</li>
+  <li><strong>Exact grade-pair changeover matrix</strong> — replace the flat "0.5 / 2.5 h" rule with real historical purge times per ordered grade pair.</li>
+  <li><strong>Shared upstream/downstream utilities</strong> — if both trains draw from a common feedstock or packaging line, that shared resource needs its own capacity constraint linking the two schedules.</li>
   <li><strong>Rolling-horizon re-optimization</strong> — re-solve as new orders arrive or priorities change, warm-starting from the current sequence.</li>
   <li><strong>Robustness</strong> — sample uncertain processing rates / late raw-material arrivals and re-optimize, or solve a chance-constrained variant.</li>
 </ul>
 <p>
-Because the model is expressed as a compact JuMP program, all of the above
-are incremental changes to the constraints already built above, not a rewrite.
-An interactive version of this same model — with live cost-weight sliders —
-is available as a Pluto.jl notebook at
+Because each train's model is a compact, independent JuMP program, all of
+the above are incremental changes to the scheduling function above, not a
+rewrite. An interactive version of this same model — with live cost-weight
+sliders — is available as a Pluto.jl notebook at
 <code>notebooks/polymer_pe_pp_scheduling.jl</code> in this repository.
 </p>
 

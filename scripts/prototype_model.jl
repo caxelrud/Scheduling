@@ -2,12 +2,17 @@
 # Prototype / validation script for the polymer (PE/PP) production scheduling MILP
 # before it is embedded into the Pluto notebook. Run with:
 #   julia --project=. scripts/prototype_model.jl
+#
+# PE and PP are made on physically separate trains (different reactor and
+# catalyst technology -- e.g. gas-phase/slurry PE lines vs. Ziegler-Natta/
+# metallocene PP lines), so this schedules TWO independent single-machine
+# problems, one per line, running in parallel from t = 0.
 
 using JuMP
 using HiGHS
 
 # ---------------------------------------------------------------------------
-# 1. Data: a single compounding/extrusion line producing PE and PP grades
+# 1. Data: a dedicated PE train and a dedicated PP train
 # ---------------------------------------------------------------------------
 
 family = Dict(
@@ -18,7 +23,6 @@ family = Dict(
     "PP-Copo-3300" => :PP,
 )
 
-# Orders: grade, quantity in tons, due date in hours from t=0, tardiness weight
 orders = [
     (id = 1, grade = "HDPE-5502",    qty = 120.0, due = 30.0,  weight = 1.0),
     (id = 2, grade = "LLDPE-2020",   qty = 80.0,  due = 40.0,  weight = 1.0),
@@ -28,9 +32,8 @@ orders = [
     (id = 6, grade = "HDPE-5502",    qty = 70.0,  due = 95.0,  weight = 1.0),
     (id = 7, grade = "PP-Homo-1100", qty = 110.0, due = 110.0, weight = 1.5),
 ]
-n = length(orders)
 
-production_rate = Dict( # tons/hour, on the single line
+production_rate = Dict( # tons/hour, on that grade's dedicated line
     "HDPE-5502"    => 5.0,
     "LLDPE-2020"   => 4.5,
     "LDPE-1922"    => 4.0,
@@ -38,106 +41,92 @@ production_rate = Dict( # tons/hour, on the single line
     "PP-Copo-3300" => 4.8,
 )
 
-proc_time = [orders[i].qty / production_rate[orders[i].grade] for i in 1:n]
+# Changeover time (hours) within a line: only ever between grades of the
+# SAME family, since PE and PP never share equipment.
+#   same grade repeated -> 0.5 h (housekeeping only)
+#   different grade      -> 2.5 h (color/additive change, partial purge)
+changeover_time(gi::String, gj::String) = gi == gj ? 0.5 : 2.5
 
-# Sequence-dependent changeover time (hours), driven by polymer family:
-#   same grade repeated       -> 0.5 h (housekeeping only)
-#   same family, diff grade   -> 2.5 h (color/additive change, partial purge)
-#   PE <-> PP family switch   -> 7.0 h (full reactor/line purge + catalyst change)
-function changeover_time(gi::String, gj::String)
-    if gi == gj
-        return 0.5
-    elseif family[gi] == family[gj]
-        return 2.5
-    else
-        return 7.0
-    end
-end
-
-s = [changeover_time(orders[i].grade, orders[j].grade) for i in 1:n, j in 1:n]
-
-# Startup time from an idle/cleaned line to the first grade of the campaign
-startup_time = 1.0
+startup_time = 1.0 # line idle -> first grade of the campaign
 
 changeover_cost_per_hour = 450.0   # $/h lost capacity + purge material
-tardiness_cost_per_hour  = 300.0   # $/h per unit of tardiness weight
+tardiness_cost_per_hour  = 300.0   # $/h per unit weight, contractual penalty
 
 # ---------------------------------------------------------------------------
-# 2. MILP: single-machine sequencing with sequence-dependent setups
-#    (asymmetric-TSP-with-time-windows-style formulation; node 0 = dummy start)
+# 2. Single-line sequencing MILP (asymmetric-TSP-with-time-windows style,
+#    node 0 = dummy start), applied independently to each line's orders
 # ---------------------------------------------------------------------------
 
-model = Model(HiGHS.Optimizer)
-set_silent(model)
+function schedule_line(line_orders)
+    m = length(line_orders)
+    pt = [o.qty / production_rate[o.grade] for o in line_orders]
+    sm = [changeover_time(line_orders[i].grade, line_orders[j].grade) for i in 1:m, j in 1:m]
 
-N  = 1:n
-N0 = 0:n  # 0 = dummy "line idle" start node
+    model = Model(HiGHS.Optimizer)
+    set_silent(model)
 
-@variable(model, x[i in N0, j in N0; i != j && j != 0], Bin)
-@variable(model, C[N] >= 0)      # completion time of order i
-@variable(model, T[N] >= 0)      # tardiness of order i
+    M  = 1:m
+    M0 = 0:m
 
-# exactly one order starts the campaign
-@constraint(model, sum(x[0, j] for j in N) == 1)
+    @variable(model, x[i in M0, j in M0; i != j && j != 0], Bin)
+    @variable(model, C[M] >= 0)
+    @variable(model, T[M] >= 0)
 
-# every order has exactly one predecessor (from 0 or another order)
-@constraint(model, [j in N], sum(x[i, j] for i in N0 if i != j) == 1)
+    @constraint(model, sum(x[0, j] for j in M) == 1)
+    @constraint(model, [j in M], sum(x[i, j] for i in M0 if i != j) == 1)
+    @constraint(model, [i in M], sum(x[i, j] for j in M if j != i) <= 1)
 
-# every order has at most one successor (open path, last order has none)
-@constraint(model, [i in N], sum(x[i, j] for j in N if j != i) <= 1)
+    bigM = startup_time + sum(pt) + (m > 0 ? sum(maximum(sm[i, :]) for i in M) : 0.0)
 
-bigM = startup_time + sum(proc_time) + sum(maximum(s[i, :]) for i in N)
+    @constraint(model, [j in M], C[j] >= startup_time + pt[j] - bigM * (1 - x[0, j]))
+    @constraint(model, [i in M, j in M; i != j],
+        C[j] >= C[i] + sm[i, j] + pt[j] - bigM * (1 - x[i, j]))
+    @constraint(model, [i in M], T[i] >= C[i] - line_orders[i].due)
 
-# timing: completion propagates along the chosen arcs; big-M relaxes the
-# inactive arcs. Because completion times must strictly increase along any
-# chain, this also rules out sub-tours without needing MTZ constraints.
-@constraint(model, [j in N], C[j] >= startup_time + proc_time[j] - bigM * (1 - x[0, j]))
-@constraint(model, [i in N, j in N; i != j],
-    C[j] >= C[i] + s[i, j] + proc_time[j] - bigM * (1 - x[i, j]))
+    @objective(model, Min,
+        changeover_cost_per_hour * sum(sm[i, j] * x[i, j] for i in M, j in M if i != j) +
+        changeover_cost_per_hour * sum(startup_time * x[0, j] for j in M) +
+        tardiness_cost_per_hour * sum(line_orders[i].weight * T[i] for i in M)
+    )
 
-# tardiness
-@constraint(model, [i in N], T[i] >= C[i] - orders[i].due)
+    optimize!(model)
+    @assert termination_status(model) == MOI.OPTIMAL
 
-# objective: minimize total changeover cost + weighted tardiness cost
-@objective(model, Min,
-    changeover_cost_per_hour * sum(s[i, j] * x[i, j] for i in N, j in N if i != j) +
-    changeover_cost_per_hour * sum(startup_time * x[0, j] for j in N) +
-    tardiness_cost_per_hour * sum(orders[i].weight * T[i] for i in N)
-)
-
-optimize!(model)
-
-println("Termination status: ", termination_status(model))
-println("Objective (\$): ", round(objective_value(model), digits = 2))
-
-# reconstruct sequence
-xval = value.(x)
-succ = Dict{Int, Int}()
-first_order = 0
-for j in N
-    if xval[0, j] > 0.5
-        global first_order = j
+    xval = value.(x)
+    succ = Dict{Int, Int}()
+    first_order = 0
+    for j in M
+        xval[0, j] > 0.5 && (first_order = j)
     end
-end
-for i in N, j in N
-    if i != j && xval[i, j] > 0.5
-        succ[i] = j
+    for i in M, j in M
+        i != j && xval[i, j] > 0.5 && (succ[i] = j)
     end
+    seq = Int[first_order]
+    let cur = first_order
+        while haskey(succ, cur)
+            cur = succ[cur]
+            push!(seq, cur)
+        end
+    end
+
+    return (seq = seq, pt = pt, C = value.(C), T = value.(T), cost = objective_value(model))
 end
 
-seq = Int[first_order]
-let cur = first_order
-    while haskey(succ, cur)
-        cur = succ[cur]
-        push!(seq, cur)
-    end
-end
+pe_orders = filter(o -> family[o.grade] == :PE, orders)
+pp_orders = filter(o -> family[o.grade] == :PP, orders)
 
-println("\nSequence: ", [orders[i].grade for i in seq])
-println("\nid  grade            qty   start   end    due   tardy")
-for i in seq
-    st = value(C[i]) - proc_time[i]
-    println(rpad(orders[i].id, 4), rpad(orders[i].grade, 16), rpad(orders[i].qty, 6),
-            rpad(round(st, digits = 1), 8), rpad(round(value(C[i]), digits = 1), 7),
-            rpad(orders[i].due, 6), round(value(T[i]), digits = 1))
+pe = schedule_line(pe_orders)
+pp = schedule_line(pp_orders)
+
+println("Total cost (\$): ", round(pe.cost + pp.cost, digits = 2))
+
+for (label, res, os) in (("PE line", pe, pe_orders), ("PP line", pp, pp_orders))
+    println("\n== ", label, " ==  cost = \$", round(res.cost, digits = 2))
+    println("id  grade            qty   start   end    due   tardy")
+    for i in res.seq
+        st = res.C[i] - res.pt[i]
+        println(rpad(os[i].id, 4), rpad(os[i].grade, 16), rpad(os[i].qty, 6),
+                rpad(round(st, digits = 1), 8), rpad(round(res.C[i], digits = 1), 7),
+                rpad(os[i].due, 6), round(res.T[i], digits = 1))
+    end
 end

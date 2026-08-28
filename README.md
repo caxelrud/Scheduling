@@ -10,12 +10,14 @@ optimization.
 ### 1. Polymer plant scheduling (PE / PP campaigns)
 
 `notebooks/polymer_pe_pp_scheduling.jl` — a Pluto notebook that schedules a
-single compounding/extrusion line producing multiple polyethylene (PE) and
-polypropylene (PP) grades. It models sequence-dependent changeover times
-(driven by PE↔PP family switches), due dates, and tardiness costs as a
-mixed-integer linear program, solves it with HiGHS, and visualizes the
-resulting campaign sequence as a Gantt chart. Cost-weight sliders let you
-explore the changeover-vs-tardiness trade-off interactively.
+polymer plant's **two dedicated production trains**: one for polyethylene
+(PE) grades, one for polypropylene (PP) grades. PE and PP use different
+reactor/catalyst technology, so they never share a line — the notebook
+solves two independent single-line MILPs (one per train) in parallel,
+each with sequence-dependent changeover times *within* its family, due
+dates, and tardiness costs. Cost-weight sliders let you explore the
+changeover-vs-tardiness trade-off interactively, and the Gantt chart shows
+both trains running side by side.
 
 A rendered PDF snapshot is at `docs/polymer_pe_pp_scheduling.pdf`.
 
