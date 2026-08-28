@@ -13,11 +13,18 @@ optimization.
 polymer plant's **two dedicated production trains**: one for polyethylene
 (PE) grades, one for polypropylene (PP) grades. PE and PP use different
 reactor/catalyst technology, so they never share a line — the notebook
-solves two independent single-line MILPs (one per train) in parallel, each
-with an explicit, often-asymmetric grade-to-grade changeover matrix *within*
-its family, due dates, and tardiness costs. Cost-weight sliders let you explore the
-changeover-vs-tardiness trade-off interactively, and the Gantt chart shows
-both trains running side by side.
+solves two independent single-line MILPs (one per train) in parallel.
+
+Raw customer orders (many small, separately-negotiated quantities per
+grade) are first **consolidated**: same-grade orders due within a
+configurable time window get pooled into one production lot, sized to the
+total and timed to the earliest ship date in the group — matching how
+plants actually plan, and cutting the number of campaigns (and therefore
+changeovers) without hurting service. Each lot then goes through an
+explicit, often-asymmetric grade-to-grade changeover matrix *within* its
+family, due dates, and tardiness costs. Cost-weight and consolidation-window
+sliders let you explore the trade-offs interactively, and the Gantt chart
+shows both trains running side by side.
 
 A rendered PDF snapshot is at `docs/polymer_pe_pp_scheduling.pdf`.
 

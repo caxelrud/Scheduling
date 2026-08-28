@@ -14,7 +14,7 @@ macro bind(def, element)
     end
 end
 
-# ╔═╡ 636888a9-4816-47d5-805c-9a6adb46ed1b
+# ╔═╡ c783b241-9716-4e31-afe7-191411ba73f3
 md"""
 # Polymer Plant Scheduling — Dedicated PE & PP Production Trains
 
@@ -42,7 +42,7 @@ the optimal campaign sequence on each train reacts to the relative cost of
 changeovers versus lateness.
 """
 
-# ╔═╡ 4107a004-ebc2-4096-8332-f7b6860851ba
+# ╔═╡ ed4c907f-68f2-4ebe-9414-8b56faa3272a
 begin
 	using JuMP
 	using HiGHS
@@ -51,21 +51,19 @@ begin
 	using Printf
 end
 
-# ╔═╡ 0c3b1ca4-b445-4ba6-8330-0887fa975892
+# ╔═╡ 026f4d46-5556-4cfc-9bba-0354cb0c2c3d
 TableOfContents(title = "Polymer Scheduling")
 
-# ╔═╡ 3f3d2d43-55b7-43b8-a01e-81bda66e27b9
+# ╔═╡ 9cc2783b-ddd0-4721-852f-8afa0e31916d
 md"""
-## 1. Plant data: grades, families, and orders
+## 1. Plant data: grades, families, and rates
 
-The plant has **7 confirmed orders** across **5 grades**: three PE grades
-(HDPE, LLDPE, LDPE) running on the PE train, and two PP grades
-(homopolymer and copolymer) running on the PP train. Each order has a
-quantity, a production rate on its train, and a customer due date (in
-hours from the scheduling horizon start, `t = 0`).
+Five grades run on the plant's two trains: three PE grades (HDPE, LLDPE,
+LDPE) on the PE train, and two PP grades (homopolymer and copolymer) on the
+PP train.
 """
 
-# ╔═╡ 104b339b-70ca-406a-a69a-0fd3bc2d427e
+# ╔═╡ bdc39a26-6ec0-406f-9434-06545ae50809
 family = Dict(
 	"HDPE-5502"    => :PE,
 	"LLDPE-2020"   => :PE,
@@ -74,7 +72,7 @@ family = Dict(
 	"PP-Copo-3300" => :PP,
 )
 
-# ╔═╡ 439e0a9a-67b1-4c14-ab92-fb0a9cbe6b05
+# ╔═╡ 129fc4c1-bb8b-48bb-a74b-3f97199957a1
 production_rate = Dict( # tons / hour, on that grade's dedicated train
 	"HDPE-5502"    => 5.0,
 	"LLDPE-2020"   => 4.5,
@@ -83,27 +81,97 @@ production_rate = Dict( # tons / hour, on that grade's dedicated train
 	"PP-Copo-3300" => 4.8,
 )
 
-# ╔═╡ af1a8ac5-20b2-4d22-9866-a81b02c19315
-orders = [
-	(id = 1, grade = "HDPE-5502",    qty = 120.0, due = 30.0,  weight = 1.0),
-	(id = 2, grade = "LLDPE-2020",   qty = 80.0,  due = 40.0,  weight = 1.0),
-	(id = 3, grade = "PP-Homo-1100", qty = 100.0, due = 55.0,  weight = 1.5),
-	(id = 4, grade = "LDPE-1922",    qty = 60.0,  due = 65.0,  weight = 1.0),
-	(id = 5, grade = "PP-Copo-3300", qty = 90.0,  due = 80.0,  weight = 1.5),
-	(id = 6, grade = "HDPE-5502",    qty = 70.0,  due = 95.0,  weight = 1.0),
-	(id = 7, grade = "PP-Homo-1100", qty = 110.0, due = 110.0, weight = 1.5),
+# ╔═╡ f9344e11-f1d6-4c76-9d0e-111e835e1d20
+md"""
+## 2. Customer orders → production lots
+
+A plant does not run one production campaign per purchase order. Sales
+orders for the **same grade** shipping close together get pooled into one
+production lot, sized to cover all of them, timed to the **earliest** ship
+date in the group — producing early never hurts the later orders in the
+group, it just means finished goods sit in the warehouse a few extra
+hours. Fewer, larger lots also mean fewer changeovers.
+
+Here are the raw customer orders behind this scheduling run:
+"""
+
+# ╔═╡ 5197ed79-8bf6-45ce-a209-00179ccd2795
+customer_orders = [
+	(customer = "A1", grade = "HDPE-5502",    qty = 45.0, due = 28.0,  weight = 1.0),
+	(customer = "A2", grade = "HDPE-5502",    qty = 35.0, due = 30.0,  weight = 1.0),
+	(customer = "A3", grade = "HDPE-5502",    qty = 40.0, due = 33.0,  weight = 1.0),
+	(customer = "B1", grade = "LLDPE-2020",   qty = 50.0, due = 38.0,  weight = 1.0),
+	(customer = "B2", grade = "LLDPE-2020",   qty = 30.0, due = 42.0,  weight = 1.0),
+	(customer = "C1", grade = "PP-Homo-1100", qty = 60.0, due = 52.0,  weight = 1.5),
+	(customer = "C2", grade = "PP-Homo-1100", qty = 40.0, due = 57.0,  weight = 1.5),
+	(customer = "D1", grade = "LDPE-1922",    qty = 25.0, due = 62.0,  weight = 1.0),
+	(customer = "D2", grade = "LDPE-1922",    qty = 35.0, due = 68.0,  weight = 1.0),
+	(customer = "E1", grade = "PP-Copo-3300", qty = 50.0, due = 76.0,  weight = 1.5),
+	(customer = "E2", grade = "PP-Copo-3300", qty = 40.0, due = 84.0,  weight = 1.5),
+	(customer = "A4", grade = "HDPE-5502",    qty = 30.0, due = 90.0,  weight = 1.0),
+	(customer = "A5", grade = "HDPE-5502",    qty = 40.0, due = 98.0,  weight = 1.0),
+	(customer = "C3", grade = "PP-Homo-1100", qty = 70.0, due = 105.0, weight = 1.5),
+	(customer = "C4", grade = "PP-Homo-1100", qty = 40.0, due = 112.0, weight = 1.5),
 ];
 
-# ╔═╡ 619b9040-2f0c-4269-883f-542806c19274
+# ╔═╡ 7436fc61-829e-4426-88de-8339fc324199
+md"""
+Consolidation window — combine same-grade orders due within this many hours
+of the earliest one in the group:
+
+$(@bind consolidation_window Slider(0:6:72, default = 24, show_value = true))
+"""
+
+# ╔═╡ 99875fe8-c864-4ed9-a305-ae9b408986fc
+function consolidate_orders(customer_orders; window = 24.0)
+	lots = NamedTuple[]
+	next_id = 1
+	for g in unique(o.grade for o in customer_orders)
+		group = sort(filter(o -> o.grade == g, customer_orders), by = o -> o.due)
+		bucket = eltype(group)[]
+		for o in group
+			if !isempty(bucket) && o.due - bucket[1].due > window
+				push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
+							 due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+							 n_combined = length(bucket)))
+				next_id += 1
+				empty!(bucket)
+			end
+			push!(bucket, o)
+		end
+		if !isempty(bucket)
+			push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
+						 due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+						 n_combined = length(bucket)))
+			next_id += 1
+		end
+	end
+	lots
+end
+
+# ╔═╡ 24ac1e27-fee1-49d2-bc04-06779b9241bd
+orders = consolidate_orders(customer_orders; window = consolidation_window)
+
+# ╔═╡ 6cf15771-643d-4a9f-be53-691b2e4a3d5a
+md"""
+$(length(customer_orders)) customer orders consolidate into
+**$(length(orders)) production lots** at a $(consolidation_window)-hour
+window:
+"""
+
+# ╔═╡ 5aec0595-393e-45bd-b10e-81f7465489c8
+orders
+
+# ╔═╡ 380e97d5-1a7a-4c3e-ad85-36837448f177
 begin
 	pe_orders = filter(o -> family[o.grade] == :PE, orders)
 	pp_orders = filter(o -> family[o.grade] == :PP, orders)
 	(pe = length(pe_orders), pp = length(pp_orders))
 end
 
-# ╔═╡ 50fa1b02-40e4-4d90-b6c0-aa35876e7d3c
+# ╔═╡ 94e4f72e-4b55-48e6-b081-0d9ca54c5fbf
 md"""
-## 2. Sequence-dependent changeovers (within a train)
+## 3. Sequence-dependent changeovers (within a train)
 
 Because a train only ever runs grades from one family, the only changeover
 decision is *within* that family. Real purge/transition times depend on the
@@ -114,7 +182,7 @@ grade is what has to be flushed out. So changeovers are given as an
 explicit `(from, to) -> hours` table rather than a flat rule:
 """
 
-# ╔═╡ f8ce68cc-f280-4a76-b1ae-c011a18394ea
+# ╔═╡ 956f4c8c-e6d6-49b4-9636-d50f865919f5
 const CHANGEOVER = Dict(
 	("HDPE-5502",    "HDPE-5502")    => 0.5,
 	("HDPE-5502",    "LLDPE-2020")   => 2.0,
@@ -132,7 +200,7 @@ const CHANGEOVER = Dict(
 )
 changeover_time(gi::String, gj::String) = CHANGEOVER[(gi, gj)]
 
-# ╔═╡ d9184e81-c3cc-466c-bc8b-c4f3a1d035a4
+# ╔═╡ 6e40c2a4-1546-4604-bbe0-c444f373cbd4
 begin
 	function changeover_matrix_md(grades)
 		header = "| from \\ to | " * join(grades, " | ") * " |"
@@ -147,10 +215,10 @@ begin
 	changeover_matrix_md(["HDPE-5502", "LLDPE-2020", "LDPE-1922"])
 end
 
-# ╔═╡ 63d326db-8036-4bf1-b1f9-efc0905b7077
+# ╔═╡ 92cd571d-7cb8-464e-b821-98d2771587e6
 changeover_matrix_md(["PP-Homo-1100", "PP-Copo-3300"])
 
-# ╔═╡ 020024d4-a525-479b-814d-681064fff68c
+# ╔═╡ fe0838f3-f10a-484f-873e-257bf9e00425
 md"""
 There is no PE ↔ PP transition to model — that changeover never happens,
 because it would require re-equipping the whole train. Use the sliders to
@@ -158,10 +226,10 @@ explore how the relative cost of a changeover-hour vs. a tardy-hour
 reshapes each train's optimal campaign order.
 """
 
-# ╔═╡ 145f722a-4ae2-4333-ad78-217a2a600297
+# ╔═╡ 91a0d917-0dd5-4feb-88b4-9d02447a08ab
 startup_time = 1.0 # train idle -> first grade of the campaign
 
-# ╔═╡ 2cfdd195-2c97-472b-91fe-074047cb7d69
+# ╔═╡ bbc70a39-6dc4-4df5-8fd3-277224c14b37
 md"""
 Changeover cost rate (\$ / hour of line time lost to purging & transition material):
 
@@ -172,9 +240,9 @@ Tardiness cost rate (\$ / hour late, per unit of order weight):
 $(@bind tardiness_cost_per_hour Slider(50:25:600, default = 300, show_value = true))
 """
 
-# ╔═╡ 170e1a62-9142-418e-946b-80aa6f14b253
+# ╔═╡ a35cb454-040e-4de9-a74f-1b5afa80b5e0
 md"""
-## 3. MILP formulation (applied once per train)
+## 4. MILP formulation (applied once per train)
 
 Each train's orders are scheduled independently. Node `0` is a dummy
 *"train idle"* start state; nodes `1..m` are that train's orders. Binary
@@ -201,7 +269,7 @@ open path. The two trains' sub-problems share no variables, so solving them
 independently is exact, not a heuristic decomposition.
 """
 
-# ╔═╡ 65f8c104-36dc-46b2-8772-bc5ff0130c18
+# ╔═╡ b764d837-c731-4b33-a070-3af2b7092cab
 function schedule_line(line_orders, changeover_cost_per_hour, tardiness_cost_per_hour)
 	m = length(line_orders)
 	pt = [o.qty / production_rate[o.grade] for o in line_orders]
@@ -257,18 +325,18 @@ function schedule_line(line_orders, changeover_cost_per_hour, tardiness_cost_per
 	 status = termination_status(model))
 end
 
-# ╔═╡ 5aef4e56-851e-483c-aa39-0bae2cda868a
+# ╔═╡ 1d47f62e-eb49-43e0-a0fc-79c4d76d154c
 pe_result = schedule_line(pe_orders, changeover_cost_per_hour, tardiness_cost_per_hour)
 
-# ╔═╡ 8f4450de-dad6-4728-9161-821c33a7cb63
+# ╔═╡ c59f6ccc-e115-48fa-8618-749ade664231
 pp_result = schedule_line(pp_orders, changeover_cost_per_hour, tardiness_cost_per_hour)
 
-# ╔═╡ 7c739c33-bff1-441e-9eb8-26d5957ef8a3
+# ╔═╡ a429e148-dfc4-46cb-981c-32bc701421e6
 md"""
-## 4. Optimal campaign sequence, per train
+## 5. Optimal campaign sequence, per train
 """
 
-# ╔═╡ e4995c67-0b2e-455e-bc9b-3ee4128e9150
+# ╔═╡ 98bceca0-3542-4604-8162-8173534f6846
 begin
 	rows(res, os) = map(res.seq) do i
 		start_t = res.C[i] - res.pt[i]
@@ -279,12 +347,12 @@ begin
 	(PE = rows(pe_result, pe_orders), PP = rows(pp_result, pp_orders))
 end
 
-# ╔═╡ 63e5e8b8-7c4d-4410-88ce-cfeec654828e
+# ╔═╡ 0c4c7da1-8455-4fb1-bee4-ec4f08ba071f
 md"""
-## 5. Gantt chart
+## 6. Gantt chart
 """
 
-# ╔═╡ cd389a3d-5dda-4dd1-afa2-4cd1895a2262
+# ╔═╡ 821d748f-f13e-439d-9127-7c8adc37eb48
 begin
 	family_color = Dict(:PE => RGB(0.20, 0.45, 0.85), :PP => RGB(0.90, 0.55, 0.10))
 
@@ -321,7 +389,7 @@ begin
 	gantt
 end
 
-# ╔═╡ 5467b9c4-83f5-4666-a3bf-425b51d399a3
+# ╔═╡ c32571be-ae39-482f-aaf0-166bc7b8f66f
 md"""
 Grade blocks are colored by polymer family (PE vs. PP); triangles mark each
 order's due date (red = missed). Because the two trains never compete for
@@ -330,12 +398,12 @@ the same equipment, they run **simultaneously**: overall makespan is the
 this as one shared line that has to purge between families.
 """
 
-# ╔═╡ 070a6da7-8c4a-48f6-b129-b5b729e2d5a2
+# ╔═╡ e8e21fb1-efa2-4ca7-91d5-7d0dfd78bb08
 md"""
-## 6. Key performance indicators
+## 7. Key performance indicators
 """
 
-# ╔═╡ bb5f2e39-6439-42b9-84a2-50c755908146
+# ╔═╡ eaec6c0f-8e2d-4ea8-81ad-4ce47e8eba62
 begin
 	makespan_pe = maximum(pe_result.C)
 	makespan_pp = maximum(pp_result.C)
@@ -357,9 +425,9 @@ begin
 	Markdown.parse(kpi_text)
 end
 
-# ╔═╡ f3801aa6-802b-41cf-96ac-9a51554318eb
+# ╔═╡ 0623bbe8-0b34-469e-9d96-fdcafe137b3f
 md"""
-## 7. Discussion & extensions
+## 8. Discussion & extensions
 
 Modeling PE and PP as two **dedicated, parallel trains** — rather than one
 shared line that pays a family-changeover penalty — matters a lot
@@ -391,30 +459,36 @@ the above are incremental changes to `schedule_line`, not a rewrite.
 """
 
 # ╔═╡ Cell order:
-# ╟─636888a9-4816-47d5-805c-9a6adb46ed1b
-# ╠═4107a004-ebc2-4096-8332-f7b6860851ba
-# ╠═0c3b1ca4-b445-4ba6-8330-0887fa975892
-# ╟─3f3d2d43-55b7-43b8-a01e-81bda66e27b9
-# ╠═104b339b-70ca-406a-a69a-0fd3bc2d427e
-# ╠═439e0a9a-67b1-4c14-ab92-fb0a9cbe6b05
-# ╠═af1a8ac5-20b2-4d22-9866-a81b02c19315
-# ╠═619b9040-2f0c-4269-883f-542806c19274
-# ╟─50fa1b02-40e4-4d90-b6c0-aa35876e7d3c
-# ╠═f8ce68cc-f280-4a76-b1ae-c011a18394ea
-# ╠═d9184e81-c3cc-466c-bc8b-c4f3a1d035a4
-# ╠═63d326db-8036-4bf1-b1f9-efc0905b7077
-# ╟─020024d4-a525-479b-814d-681064fff68c
-# ╠═145f722a-4ae2-4333-ad78-217a2a600297
-# ╟─2cfdd195-2c97-472b-91fe-074047cb7d69
-# ╟─170e1a62-9142-418e-946b-80aa6f14b253
-# ╠═65f8c104-36dc-46b2-8772-bc5ff0130c18
-# ╠═5aef4e56-851e-483c-aa39-0bae2cda868a
-# ╠═8f4450de-dad6-4728-9161-821c33a7cb63
-# ╟─7c739c33-bff1-441e-9eb8-26d5957ef8a3
-# ╠═e4995c67-0b2e-455e-bc9b-3ee4128e9150
-# ╟─63e5e8b8-7c4d-4410-88ce-cfeec654828e
-# ╠═cd389a3d-5dda-4dd1-afa2-4cd1895a2262
-# ╟─5467b9c4-83f5-4666-a3bf-425b51d399a3
-# ╟─070a6da7-8c4a-48f6-b129-b5b729e2d5a2
-# ╠═bb5f2e39-6439-42b9-84a2-50c755908146
-# ╟─f3801aa6-802b-41cf-96ac-9a51554318eb
+# ╟─c783b241-9716-4e31-afe7-191411ba73f3
+# ╠═ed4c907f-68f2-4ebe-9414-8b56faa3272a
+# ╠═026f4d46-5556-4cfc-9bba-0354cb0c2c3d
+# ╟─9cc2783b-ddd0-4721-852f-8afa0e31916d
+# ╠═bdc39a26-6ec0-406f-9434-06545ae50809
+# ╠═129fc4c1-bb8b-48bb-a74b-3f97199957a1
+# ╟─f9344e11-f1d6-4c76-9d0e-111e835e1d20
+# ╠═5197ed79-8bf6-45ce-a209-00179ccd2795
+# ╟─7436fc61-829e-4426-88de-8339fc324199
+# ╠═99875fe8-c864-4ed9-a305-ae9b408986fc
+# ╠═24ac1e27-fee1-49d2-bc04-06779b9241bd
+# ╟─6cf15771-643d-4a9f-be53-691b2e4a3d5a
+# ╠═5aec0595-393e-45bd-b10e-81f7465489c8
+# ╠═380e97d5-1a7a-4c3e-ad85-36837448f177
+# ╟─94e4f72e-4b55-48e6-b081-0d9ca54c5fbf
+# ╠═956f4c8c-e6d6-49b4-9636-d50f865919f5
+# ╠═6e40c2a4-1546-4604-bbe0-c444f373cbd4
+# ╠═92cd571d-7cb8-464e-b821-98d2771587e6
+# ╟─fe0838f3-f10a-484f-873e-257bf9e00425
+# ╠═91a0d917-0dd5-4feb-88b4-9d02447a08ab
+# ╟─bbc70a39-6dc4-4df5-8fd3-277224c14b37
+# ╟─a35cb454-040e-4de9-a74f-1b5afa80b5e0
+# ╠═b764d837-c731-4b33-a070-3af2b7092cab
+# ╠═1d47f62e-eb49-43e0-a0fc-79c4d76d154c
+# ╠═c59f6ccc-e115-48fa-8618-749ade664231
+# ╟─a429e148-dfc4-46cb-981c-32bc701421e6
+# ╠═98bceca0-3542-4604-8162-8173534f6846
+# ╟─0c4c7da1-8455-4fb1-bee4-ec4f08ba071f
+# ╠═821d748f-f13e-439d-9127-7c8adc37eb48
+# ╟─c32571be-ae39-482f-aaf0-166bc7b8f66f
+# ╟─e8e21fb1-efa2-4ca7-91d5-7d0dfd78bb08
+# ╠═eaec6c0f-8e2d-4ea8-81ad-4ce47e8eba62
+# ╟─0623bbe8-0b34-469e-9d96-fdcafe137b3f

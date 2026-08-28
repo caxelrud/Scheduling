@@ -56,13 +56,11 @@ push!(cells, NBCell("TableOfContents(title = \"Polymer Scheduling\")", true))
 
 push!(cells, NBCell("""
 md\"\"\"
-## 1. Plant data: grades, families, and orders
+## 1. Plant data: grades, families, and rates
 
-The plant has **7 confirmed orders** across **5 grades**: three PE grades
-(HDPE, LLDPE, LDPE) running on the PE train, and two PP grades
-(homopolymer and copolymer) running on the PP train. Each order has a
-quantity, a production rate on its train, and a customer due date (in
-hours from the scheduling horizon start, `t = 0`).
+Five grades run on the plant's two trains: three PE grades (HDPE, LLDPE,
+LDPE) on the PE train, and two PP grades (homopolymer and copolymer) on the
+PP train.
 \"\"\"
 """, false))
 
@@ -87,16 +85,90 @@ production_rate = Dict( # tons / hour, on that grade's dedicated train
 """, true))
 
 push!(cells, NBCell("""
-orders = [
-	(id = 1, grade = "HDPE-5502",    qty = 120.0, due = 30.0,  weight = 1.0),
-	(id = 2, grade = "LLDPE-2020",   qty = 80.0,  due = 40.0,  weight = 1.0),
-	(id = 3, grade = "PP-Homo-1100", qty = 100.0, due = 55.0,  weight = 1.5),
-	(id = 4, grade = "LDPE-1922",    qty = 60.0,  due = 65.0,  weight = 1.0),
-	(id = 5, grade = "PP-Copo-3300", qty = 90.0,  due = 80.0,  weight = 1.5),
-	(id = 6, grade = "HDPE-5502",    qty = 70.0,  due = 95.0,  weight = 1.0),
-	(id = 7, grade = "PP-Homo-1100", qty = 110.0, due = 110.0, weight = 1.5),
+md\"\"\"
+## 2. Customer orders → production lots
+
+A plant does not run one production campaign per purchase order. Sales
+orders for the **same grade** shipping close together get pooled into one
+production lot, sized to cover all of them, timed to the **earliest** ship
+date in the group — producing early never hurts the later orders in the
+group, it just means finished goods sit in the warehouse a few extra
+hours. Fewer, larger lots also mean fewer changeovers.
+
+Here are the raw customer orders behind this scheduling run:
+\"\"\"
+""", false))
+
+push!(cells, NBCell("""
+customer_orders = [
+	(customer = "A1", grade = "HDPE-5502",    qty = 45.0, due = 28.0,  weight = 1.0),
+	(customer = "A2", grade = "HDPE-5502",    qty = 35.0, due = 30.0,  weight = 1.0),
+	(customer = "A3", grade = "HDPE-5502",    qty = 40.0, due = 33.0,  weight = 1.0),
+	(customer = "B1", grade = "LLDPE-2020",   qty = 50.0, due = 38.0,  weight = 1.0),
+	(customer = "B2", grade = "LLDPE-2020",   qty = 30.0, due = 42.0,  weight = 1.0),
+	(customer = "C1", grade = "PP-Homo-1100", qty = 60.0, due = 52.0,  weight = 1.5),
+	(customer = "C2", grade = "PP-Homo-1100", qty = 40.0, due = 57.0,  weight = 1.5),
+	(customer = "D1", grade = "LDPE-1922",    qty = 25.0, due = 62.0,  weight = 1.0),
+	(customer = "D2", grade = "LDPE-1922",    qty = 35.0, due = 68.0,  weight = 1.0),
+	(customer = "E1", grade = "PP-Copo-3300", qty = 50.0, due = 76.0,  weight = 1.5),
+	(customer = "E2", grade = "PP-Copo-3300", qty = 40.0, due = 84.0,  weight = 1.5),
+	(customer = "A4", grade = "HDPE-5502",    qty = 30.0, due = 90.0,  weight = 1.0),
+	(customer = "A5", grade = "HDPE-5502",    qty = 40.0, due = 98.0,  weight = 1.0),
+	(customer = "C3", grade = "PP-Homo-1100", qty = 70.0, due = 105.0, weight = 1.5),
+	(customer = "C4", grade = "PP-Homo-1100", qty = 40.0, due = 112.0, weight = 1.5),
 ];
 """, true))
+
+push!(cells, NBCell("""
+md\"\"\"
+Consolidation window — combine same-grade orders due within this many hours
+of the earliest one in the group:
+
+\$(@bind consolidation_window Slider(0:6:72, default = 24, show_value = true))
+\"\"\"
+""", false))
+
+push!(cells, NBCell("""
+function consolidate_orders(customer_orders; window = 24.0)
+	lots = NamedTuple[]
+	next_id = 1
+	for g in unique(o.grade for o in customer_orders)
+		group = sort(filter(o -> o.grade == g, customer_orders), by = o -> o.due)
+		bucket = eltype(group)[]
+		for o in group
+			if !isempty(bucket) && o.due - bucket[1].due > window
+				push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
+							 due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+							 n_combined = length(bucket)))
+				next_id += 1
+				empty!(bucket)
+			end
+			push!(bucket, o)
+		end
+		if !isempty(bucket)
+			push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
+						 due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+						 n_combined = length(bucket)))
+			next_id += 1
+		end
+	end
+	lots
+end
+""", true))
+
+push!(cells, NBCell("""
+orders = consolidate_orders(customer_orders; window = consolidation_window)
+""", true))
+
+push!(cells, NBCell("""
+md\"\"\"
+\$(length(customer_orders)) customer orders consolidate into
+**\$(length(orders)) production lots** at a \$(consolidation_window)-hour
+window:
+\"\"\"
+""", false))
+
+push!(cells, NBCell("orders", true))
 
 push!(cells, NBCell("""
 begin
@@ -108,7 +180,7 @@ end
 
 push!(cells, NBCell("""
 md\"\"\"
-## 2. Sequence-dependent changeovers (within a train)
+## 3. Sequence-dependent changeovers (within a train)
 
 Because a train only ever runs grades from one family, the only changeover
 decision is *within* that family. Real purge/transition times depend on the
@@ -186,7 +258,7 @@ Tardiness cost rate (\\\$ / hour late, per unit of order weight):
 
 push!(cells, NBCell("""
 md\"\"\"
-## 3. MILP formulation (applied once per train)
+## 4. MILP formulation (applied once per train)
 
 Each train's orders are scheduled independently. Node `0` is a dummy
 *"train idle"* start state; nodes `1..m` are that train's orders. Binary
@@ -281,7 +353,7 @@ pp_result = schedule_line(pp_orders, changeover_cost_per_hour, tardiness_cost_pe
 
 push!(cells, NBCell("""
 md\"\"\"
-## 4. Optimal campaign sequence, per train
+## 5. Optimal campaign sequence, per train
 \"\"\"
 """, false))
 
@@ -299,7 +371,7 @@ end
 
 push!(cells, NBCell("""
 md\"\"\"
-## 5. Gantt chart
+## 6. Gantt chart
 \"\"\"
 """, false))
 
@@ -353,7 +425,7 @@ this as one shared line that has to purge between families.
 
 push!(cells, NBCell("""
 md\"\"\"
-## 6. Key performance indicators
+## 7. Key performance indicators
 \"\"\"
 """, false))
 
@@ -382,7 +454,7 @@ end
 
 push!(cells, NBCell("""
 md\"\"\"
-## 7. Discussion & extensions
+## 8. Discussion & extensions
 
 Modeling PE and PP as two **dedicated, parallel trains** — rather than one
 shared line that pays a family-changeover penalty — matters a lot

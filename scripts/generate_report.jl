@@ -35,15 +35,63 @@ production_rate = Dict(
     "PP-Copo-3300" => 4.8,
 )
 
-orders = [
-    (id = 1, grade = "HDPE-5502",    qty = 120.0, due = 30.0,  weight = 1.0),
-    (id = 2, grade = "LLDPE-2020",   qty = 80.0,  due = 40.0,  weight = 1.0),
-    (id = 3, grade = "PP-Homo-1100", qty = 100.0, due = 55.0,  weight = 1.5),
-    (id = 4, grade = "LDPE-1922",    qty = 60.0,  due = 65.0,  weight = 1.0),
-    (id = 5, grade = "PP-Copo-3300", qty = 90.0,  due = 80.0,  weight = 1.5),
-    (id = 6, grade = "HDPE-5502",    qty = 70.0,  due = 95.0,  weight = 1.0),
-    (id = 7, grade = "PP-Homo-1100", qty = 110.0, due = 110.0, weight = 1.5),
+# Raw sales orders, as they actually arrive from customers: many small,
+# separately-negotiated quantities per grade, each with its own ship date.
+# A plant does not run one production campaign per purchase order -- orders
+# for the same grade shipping close together get pooled into one production
+# lot, sized to cover all of them, timed to the earliest ship date in the
+# group (producing early never hurts the later ones in the group; it just
+# means finished goods sit in the warehouse a few extra hours/days).
+customer_orders = [
+    (customer = "A1", grade = "HDPE-5502",    qty = 45.0, due = 28.0,  weight = 1.0),
+    (customer = "A2", grade = "HDPE-5502",    qty = 35.0, due = 30.0,  weight = 1.0),
+    (customer = "A3", grade = "HDPE-5502",    qty = 40.0, due = 33.0,  weight = 1.0),
+    (customer = "B1", grade = "LLDPE-2020",   qty = 50.0, due = 38.0,  weight = 1.0),
+    (customer = "B2", grade = "LLDPE-2020",   qty = 30.0, due = 42.0,  weight = 1.0),
+    (customer = "C1", grade = "PP-Homo-1100", qty = 60.0, due = 52.0,  weight = 1.5),
+    (customer = "C2", grade = "PP-Homo-1100", qty = 40.0, due = 57.0,  weight = 1.5),
+    (customer = "D1", grade = "LDPE-1922",    qty = 25.0, due = 62.0,  weight = 1.0),
+    (customer = "D2", grade = "LDPE-1922",    qty = 35.0, due = 68.0,  weight = 1.0),
+    (customer = "E1", grade = "PP-Copo-3300", qty = 50.0, due = 76.0,  weight = 1.5),
+    (customer = "E2", grade = "PP-Copo-3300", qty = 40.0, due = 84.0,  weight = 1.5),
+    (customer = "A4", grade = "HDPE-5502",    qty = 30.0, due = 90.0,  weight = 1.0),
+    (customer = "A5", grade = "HDPE-5502",    qty = 40.0, due = 98.0,  weight = 1.0),
+    (customer = "C3", grade = "PP-Homo-1100", qty = 70.0, due = 105.0, weight = 1.5),
+    (customer = "C4", grade = "PP-Homo-1100", qty = 40.0, due = 112.0, weight = 1.5),
 ]
+
+# Consolidate same-grade customer orders whose due dates fall within
+# `window` hours of the earliest (most urgent) due date in the group into
+# one production lot: quantity = sum, due = earliest, weight = the most
+# urgent customer's weight (a lot inherits its most demanding member).
+function consolidate_orders(customer_orders; window = 24.0)
+    lots = NamedTuple[]
+    next_id = 1
+    for g in unique(o.grade for o in customer_orders)
+        group = sort(filter(o -> o.grade == g, customer_orders), by = o -> o.due)
+        bucket = eltype(group)[]
+        for o in group
+            if !isempty(bucket) && o.due - bucket[1].due > window
+                push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
+                             due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+                             n_combined = length(bucket)))
+                next_id += 1
+                empty!(bucket)
+            end
+            push!(bucket, o)
+        end
+        if !isempty(bucket)
+            push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
+                         due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+                         n_combined = length(bucket)))
+            next_id += 1
+        end
+    end
+    lots
+end
+
+const CONSOLIDATION_WINDOW = 24.0
+orders = consolidate_orders(customer_orders; window = CONSOLIDATION_WINDOW)
 n = length(orders)
 pe_orders = filter(o -> family[o.grade] == :PE, orders)
 pp_orders = filter(o -> family[o.grade] == :PP, orders)
@@ -297,22 +345,49 @@ a mixed-integer linear program (MILP), built with
 <a href="https://highs.dev">HiGHS</a> solver.
 </p>
 
-<h2>1. Plant data: grades, families, and orders</h2>
+<h2>1. Plant data: grades, families, and rates</h2>
 <p>
-The plant has <strong>$(n) confirmed orders</strong> across
-<strong>5 grades</strong>: three PE grades (HDPE, LLDPE, LDPE) on the PE
-train, and two PP grades (homopolymer and copolymer) on the PP train. Each
-order has a quantity, a production rate on its train, and a customer due
-date (in hours from the scheduling horizon start, t&nbsp;=&nbsp;0).
+Five grades run on the plant's two trains: three PE grades (HDPE, LLDPE,
+LDPE) on the PE train, and two PP grades (homopolymer and copolymer) on the
+PP train.
 </p>
 <table>
-<thead><tr><th>Order</th><th>Grade</th><th>Train</th><th>Qty (t)</th><th>Rate (t/h)</th><th>Due (h)</th><th>Weight</th></tr></thead>
+<thead><tr><th>Grade</th><th>Train</th><th>Rate (t/h)</th></tr></thead>
 <tbody>
-$(join(["<tr><td>$(o.id)</td><td>$(o.grade)</td><td>$(String(family[o.grade]))</td><td>$(@sprintf("%.0f", o.qty))</td><td>$(@sprintf("%.1f", production_rate[o.grade]))</td><td>$(@sprintf("%.0f", o.due))</td><td>$(o.weight)</td></tr>" for o in orders]))
+$(join(["<tr><td>$g</td><td>$(String(family[g]))</td><td>$(@sprintf("%.1f", production_rate[g]))</td></tr>" for g in ["HDPE-5502", "LLDPE-2020", "LDPE-1922", "PP-Homo-1100", "PP-Copo-3300"]]))
 </tbody>
 </table>
 
-<h2>2. Sequence-dependent changeovers (within a train)</h2>
+<h2>2. Customer orders &rarr; production lots</h2>
+<p>
+A plant does not run one production campaign per purchase order. Sales
+orders for the <strong>same grade</strong> shipping close together get
+pooled into one production lot, sized to cover all of them, timed to the
+<strong>earliest</strong> ship date in the group — producing early never
+hurts the later orders in the group, it just means finished goods sit in
+the warehouse a few extra hours. Fewer, larger lots also mean fewer
+changeovers. This run uses a <strong>$(@sprintf("%.0f", CONSOLIDATION_WINDOW))-hour</strong>
+consolidation window (same-grade orders due within that many hours of the
+earliest one in the group are pooled together).
+</p>
+<table>
+<thead><tr><th>Customer</th><th>Grade</th><th>Qty (t)</th><th>Due (h)</th></tr></thead>
+<tbody>
+$(join(["<tr><td>$(o.customer)</td><td>$(o.grade)</td><td>$(@sprintf("%.0f", o.qty))</td><td>$(@sprintf("%.0f", o.due))</td></tr>" for o in customer_orders]))
+</tbody>
+</table>
+<p class="note">
+<strong>$(length(customer_orders)) customer orders</strong> consolidate into
+<strong>$(n) production lots</strong>:
+</p>
+<table>
+<thead><tr><th>Lot</th><th>Grade</th><th>Qty (t)</th><th>Due (h)</th><th>Weight</th><th>Combines</th></tr></thead>
+<tbody>
+$(join(["<tr><td>$(o.id)</td><td>$(o.grade)</td><td>$(@sprintf("%.0f", o.qty))</td><td>$(@sprintf("%.0f", o.due))</td><td>$(o.weight)</td><td>$(o.n_combined) customer order(s)</td></tr>" for o in orders]))
+</tbody>
+</table>
+
+<h2>3. Sequence-dependent changeovers (within a train)</h2>
 <p>
 Because a train only ever runs grades from one family, the only changeover
 decision is <em>within</em> that family. Real purge/transition times depend
@@ -335,7 +410,7 @@ because it would require re-equipping the whole train.
 <strong>\$$(@sprintf("%.0f", tardiness_cost_per_hour))/h</strong> per unit
 order weight. (The companion Pluto notebook exposes both as live sliders.)</p>
 
-<h2>3. MILP formulation (applied once per train)</h2>
+<h2>4. MILP formulation (applied once per train)</h2>
 <p>
 Each train's orders are scheduled independently. Node 0 is a dummy "train
 idle" start state; nodes 1..m are that train's orders. Binary variables
@@ -362,7 +437,7 @@ HiGHS is exact, not a heuristic decomposition — both reach global optimality
 in well under a second.
 </p>
 
-<h2>4. Optimal campaign sequence, per train</h2>
+<h2>5. Optimal campaign sequence, per train</h2>
 <table>
 <thead><tr><th>Train</th><th>Order</th><th>Grade</th><th>Qty (t)</th><th>Start (h)</th><th>End (h)</th><th>Due (h)</th><th>Status</th></tr></thead>
 <tbody>
@@ -370,7 +445,7 @@ $(rows_html)
 </tbody>
 </table>
 
-<h2>5. Gantt chart</h2>
+<h2>6. Gantt chart</h2>
 <img class="gantt" src="data:image/png;base64,$(gantt_b64)" alt="Gantt chart of the two parallel production trains">
 <p>
 Grade blocks are colored by polymer family (<span class="legend-pe">PE</span> vs.
@@ -380,7 +455,7 @@ Because the two trains never compete for the same equipment, they run
 the two trains, not the sum of both.
 </p>
 
-<h2>6. Key performance indicators</h2>
+<h2>7. Key performance indicators</h2>
 <div class="kpi-grid">
   <div class="kpi"><div class="label">PE train makespan</div><div class="value">$(@sprintf("%.1f", makespan_pe)) h</div></div>
   <div class="kpi"><div class="label">PP train makespan</div><div class="value">$(@sprintf("%.1f", makespan_pp)) h</div></div>
@@ -392,7 +467,7 @@ Tardiness: $(@sprintf("%.1f", total_tardy_h)) h across $(n_tardy_orders) of $(n)
 PE train cost: \$$(@sprintf("%.0f", pe.cost)); PP train cost: \$$(@sprintf("%.0f", pp.cost)).
 </p>
 
-<h2>7. Discussion &amp; extensions</h2>
+<h2>8. Discussion &amp; extensions</h2>
 <p>
 Modeling PE and PP as two <strong>dedicated, parallel trains</strong> —
 rather than one shared line that pays a family-changeover penalty — matters

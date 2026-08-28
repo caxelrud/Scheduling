@@ -23,15 +23,62 @@ family = Dict(
     "PP-Copo-3300" => :PP,
 )
 
-orders = [
-    (id = 1, grade = "HDPE-5502",    qty = 120.0, due = 30.0,  weight = 1.0),
-    (id = 2, grade = "LLDPE-2020",   qty = 80.0,  due = 40.0,  weight = 1.0),
-    (id = 3, grade = "PP-Homo-1100", qty = 100.0, due = 55.0,  weight = 1.5),
-    (id = 4, grade = "LDPE-1922",    qty = 60.0,  due = 65.0,  weight = 1.0),
-    (id = 5, grade = "PP-Copo-3300", qty = 90.0,  due = 80.0,  weight = 1.5),
-    (id = 6, grade = "HDPE-5502",    qty = 70.0,  due = 95.0,  weight = 1.0),
-    (id = 7, grade = "PP-Homo-1100", qty = 110.0, due = 110.0, weight = 1.5),
+# Raw sales orders, as they actually arrive from customers: many small,
+# separately-negotiated quantities per grade, each with its own ship date.
+# A plant does not run one production campaign per purchase order -- orders
+# for the same grade shipping close together get pooled into one production
+# lot, sized to cover all of them, timed to the earliest ship date in the
+# group (producing early never hurts the later ones in the group; it just
+# means finished goods sit in the warehouse a few extra hours/days).
+customer_orders = [
+    (customer = "A1", grade = "HDPE-5502",    qty = 45.0, due = 28.0,  weight = 1.0),
+    (customer = "A2", grade = "HDPE-5502",    qty = 35.0, due = 30.0,  weight = 1.0),
+    (customer = "A3", grade = "HDPE-5502",    qty = 40.0, due = 33.0,  weight = 1.0),
+    (customer = "B1", grade = "LLDPE-2020",   qty = 50.0, due = 38.0,  weight = 1.0),
+    (customer = "B2", grade = "LLDPE-2020",   qty = 30.0, due = 42.0,  weight = 1.0),
+    (customer = "C1", grade = "PP-Homo-1100", qty = 60.0, due = 52.0,  weight = 1.5),
+    (customer = "C2", grade = "PP-Homo-1100", qty = 40.0, due = 57.0,  weight = 1.5),
+    (customer = "D1", grade = "LDPE-1922",    qty = 25.0, due = 62.0,  weight = 1.0),
+    (customer = "D2", grade = "LDPE-1922",    qty = 35.0, due = 68.0,  weight = 1.0),
+    (customer = "E1", grade = "PP-Copo-3300", qty = 50.0, due = 76.0,  weight = 1.5),
+    (customer = "E2", grade = "PP-Copo-3300", qty = 40.0, due = 84.0,  weight = 1.5),
+    (customer = "A4", grade = "HDPE-5502",    qty = 30.0, due = 90.0,  weight = 1.0),
+    (customer = "A5", grade = "HDPE-5502",    qty = 40.0, due = 98.0,  weight = 1.0),
+    (customer = "C3", grade = "PP-Homo-1100", qty = 70.0, due = 105.0, weight = 1.5),
+    (customer = "C4", grade = "PP-Homo-1100", qty = 40.0, due = 112.0, weight = 1.5),
 ]
+
+# Consolidate same-grade customer orders whose due dates fall within
+# `window` hours of the earliest (most urgent) due date in the group into
+# one production lot: quantity = sum, due = earliest, weight = the most
+# urgent customer's weight (a lot inherits its most demanding member).
+function consolidate_orders(customer_orders; window = 24.0)
+    lots = NamedTuple[]
+    next_id = 1
+    for g in unique(o.grade for o in customer_orders)
+        group = sort(filter(o -> o.grade == g, customer_orders), by = o -> o.due)
+        bucket = eltype(group)[]
+        for o in group
+            if !isempty(bucket) && o.due - bucket[1].due > window
+                push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
+                             due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+                             n_combined = length(bucket)))
+                next_id += 1
+                empty!(bucket)
+            end
+            push!(bucket, o)
+        end
+        if !isempty(bucket)
+            push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
+                         due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+                         n_combined = length(bucket)))
+            next_id += 1
+        end
+    end
+    lots
+end
+
+orders = consolidate_orders(customer_orders; window = 24.0)
 
 production_rate = Dict( # tons/hour, on that grade's dedicated line
     "HDPE-5502"    => 5.0,
@@ -127,6 +174,12 @@ function schedule_line(line_orders)
     end
 
     return (seq = seq, pt = pt, C = value.(C), T = value.(T), cost = objective_value(model))
+end
+
+println(length(customer_orders), " customer orders consolidated into ", length(orders), " production lots:")
+for o in orders
+    println(rpad(o.id, 4), rpad(o.grade, 16), rpad(o.qty, 6), rpad(o.due, 6),
+             "(combines ", o.n_combined, " customer order(s))")
 end
 
 pe_orders = filter(o -> family[o.grade] == :PE, orders)
