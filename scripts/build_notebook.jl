@@ -17,9 +17,11 @@ push!(cells, NBCell("""
 md\"\"\"
 # Polymer Plant Scheduling — Dedicated PE & PP Production Trains
 
-This notebook builds and solves a **production scheduling model** for a
-polymer plant that manufactures several grades of **polyethylene (PE)** and
-**polypropylene (PP)**.
+This notebook builds and solves a **month-long production schedule** (a
+30-day, 720-hour horizon) for a polymer plant that manufactures **8 grades**
+of **polyethylene (PE)** and **polypropylene (PP)**. Each grade runs as a
+multi-day campaign, and changeovers between grades take a few hours — the
+scale real plant schedulers actually work at.
 
 PE and PP are made on **physically separate trains**: different reactor
 technology and catalyst systems (e.g. gas-phase/slurry PE reactors vs.
@@ -58,29 +60,40 @@ push!(cells, NBCell("""
 md\"\"\"
 ## 1. Plant data: grades, families, and rates
 
-Five grades run on the plant's two trains: three PE grades (HDPE, LLDPE,
-LDPE) on the PE train, and two PP grades (homopolymer and copolymer) on the
-PP train.
+Eight grades run on the plant's two trains: four PE grades (two HDPE
+grades, one LLDPE, one LDPE) on the PE train, and four PP grades
+(two homopolymer variants, one random copolymer, one impact copolymer) on
+the PP train.
 \"\"\"
 """, false))
 
 push!(cells, NBCell("""
+const HORIZON_HOURS = 720.0 # 30-day scheduling horizon
+""", true))
+
+push!(cells, NBCell("""
 family = Dict(
-	"HDPE-5502"    => :PE,
-	"LLDPE-2020"   => :PE,
-	"LDPE-1922"    => :PE,
-	"PP-Homo-1100" => :PP,
-	"PP-Copo-3300" => :PP,
+	"HDPE-5502"      => :PE,
+	"HDPE-6200"      => :PE,
+	"LLDPE-2020"     => :PE,
+	"LDPE-1922"      => :PE,
+	"PP-Homo-1100"   => :PP,
+	"PP-Homo-1305"   => :PP,
+	"PP-Copo-3300"   => :PP,
+	"PP-Impact-7015" => :PP,
 )
 """, true))
 
 push!(cells, NBCell("""
 production_rate = Dict( # tons / hour, on that grade's dedicated train
-	"HDPE-5502"    => 5.0,
-	"LLDPE-2020"   => 4.5,
-	"LDPE-1922"    => 4.0,
-	"PP-Homo-1100" => 5.5,
-	"PP-Copo-3300" => 4.8,
+	"HDPE-5502"      => 5.0,
+	"HDPE-6200"      => 5.5,
+	"LLDPE-2020"     => 4.5,
+	"LDPE-1922"      => 4.0,
+	"PP-Homo-1100"   => 5.5,
+	"PP-Homo-1305"   => 5.0,
+	"PP-Copo-3300"   => 4.8,
+	"PP-Impact-7015" => 4.5,
 )
 """, true))
 
@@ -101,21 +114,46 @@ Here are the raw customer orders behind this scheduling run:
 
 push!(cells, NBCell("""
 customer_orders = [
-	(customer = "A1", grade = "HDPE-5502",    qty = 45.0, due = 28.0,  weight = 1.0),
-	(customer = "A2", grade = "HDPE-5502",    qty = 35.0, due = 30.0,  weight = 1.0),
-	(customer = "A3", grade = "HDPE-5502",    qty = 40.0, due = 33.0,  weight = 1.0),
-	(customer = "B1", grade = "LLDPE-2020",   qty = 50.0, due = 38.0,  weight = 1.0),
-	(customer = "B2", grade = "LLDPE-2020",   qty = 30.0, due = 42.0,  weight = 1.0),
-	(customer = "C1", grade = "PP-Homo-1100", qty = 60.0, due = 52.0,  weight = 1.5),
-	(customer = "C2", grade = "PP-Homo-1100", qty = 40.0, due = 57.0,  weight = 1.5),
-	(customer = "D1", grade = "LDPE-1922",    qty = 25.0, due = 62.0,  weight = 1.0),
-	(customer = "D2", grade = "LDPE-1922",    qty = 35.0, due = 68.0,  weight = 1.0),
-	(customer = "E1", grade = "PP-Copo-3300", qty = 50.0, due = 76.0,  weight = 1.5),
-	(customer = "E2", grade = "PP-Copo-3300", qty = 40.0, due = 84.0,  weight = 1.5),
-	(customer = "A4", grade = "HDPE-5502",    qty = 30.0, due = 90.0,  weight = 1.0),
-	(customer = "A5", grade = "HDPE-5502",    qty = 40.0, due = 98.0,  weight = 1.0),
-	(customer = "C3", grade = "PP-Homo-1100", qty = 70.0, due = 105.0, weight = 1.5),
-	(customer = "C4", grade = "PP-Homo-1100", qty = 40.0, due = 112.0, weight = 1.5),
+	# HDPE-5502 (blow molding)
+	(customer = "A1", grade = "HDPE-5502", qty = 220.0, due = 212.0),
+	(customer = "A2", grade = "HDPE-5502", qty = 180.0, due = 220.0),
+	(customer = "A3", grade = "HDPE-5502", qty = 200.0, due = 548.0),
+	(customer = "A4", grade = "HDPE-5502", qty = 200.0, due = 556.0),
+	# HDPE-6200 (film)
+	(customer = "B1", grade = "HDPE-6200", qty = 240.0, due = 260.0),
+	(customer = "B2", grade = "HDPE-6200", qty = 200.0, due = 268.0),
+	(customer = "B3", grade = "HDPE-6200", qty = 240.0, due = 596.0),
+	(customer = "B4", grade = "HDPE-6200", qty = 200.0, due = 604.0),
+	# LLDPE-2020 (film)
+	(customer = "C1", grade = "LLDPE-2020", qty = 190.0, due = 188.0),
+	(customer = "C2", grade = "LLDPE-2020", qty = 150.0, due = 196.0),
+	(customer = "C3", grade = "LLDPE-2020", qty = 190.0, due = 524.0),
+	(customer = "C4", grade = "LLDPE-2020", qty = 150.0, due = 532.0),
+	# LDPE-1922 (extrusion coating)
+	(customer = "D1", grade = "LDPE-1922", qty = 150.0, due = 308.0),
+	(customer = "D2", grade = "LDPE-1922", qty = 130.0, due = 316.0),
+	(customer = "D3", grade = "LDPE-1922", qty = 150.0, due = 644.0),
+	(customer = "D4", grade = "LDPE-1922", qty = 130.0, due = 652.0),
+	# PP-Homo-1100 (injection)
+	(customer = "E1", grade = "PP-Homo-1100", qty = 260.0, due = 236.0),
+	(customer = "E2", grade = "PP-Homo-1100", qty = 210.0, due = 244.0),
+	(customer = "E3", grade = "PP-Homo-1100", qty = 260.0, due = 572.0),
+	(customer = "E4", grade = "PP-Homo-1100", qty = 210.0, due = 580.0),
+	# PP-Homo-1305 (fiber)
+	(customer = "F1", grade = "PP-Homo-1305", qty = 220.0, due = 284.0),
+	(customer = "F2", grade = "PP-Homo-1305", qty = 180.0, due = 292.0),
+	(customer = "F3", grade = "PP-Homo-1305", qty = 220.0, due = 620.0),
+	(customer = "F4", grade = "PP-Homo-1305", qty = 180.0, due = 628.0),
+	# PP-Copo-3300 (random copolymer)
+	(customer = "G1", grade = "PP-Copo-3300", qty = 200.0, due = 224.0),
+	(customer = "G2", grade = "PP-Copo-3300", qty = 160.0, due = 232.0),
+	(customer = "G3", grade = "PP-Copo-3300", qty = 200.0, due = 560.0),
+	(customer = "G4", grade = "PP-Copo-3300", qty = 160.0, due = 568.0),
+	# PP-Impact-7015 (impact copolymer)
+	(customer = "H1", grade = "PP-Impact-7015", qty = 175.0, due = 332.0),
+	(customer = "H2", grade = "PP-Impact-7015", qty = 140.0, due = 340.0),
+	(customer = "H3", grade = "PP-Impact-7015", qty = 175.0, due = 668.0),
+	(customer = "H4", grade = "PP-Impact-7015", qty = 140.0, due = 676.0),
 ];
 """, true))
 
@@ -124,9 +162,15 @@ md\"\"\"
 Consolidation window — combine same-grade orders due within this many hours
 of the earliest one in the group:
 
-\$(@bind consolidation_window Slider(0:6:72, default = 24, show_value = true))
+\$(@bind consolidation_window Slider(0:6:96, default = 24, show_value = true))
 \"\"\"
 """, false))
+
+push!(cells, NBCell("""
+# PP grades carry a higher contractual tardiness weight than PE in this
+# example.
+order_weight(g::String) = family[g] == :PP ? 1.5 : 1.0
+""", true))
 
 push!(cells, NBCell("""
 function consolidate_orders(customer_orders; window = 24.0)
@@ -138,7 +182,7 @@ function consolidate_orders(customer_orders; window = 24.0)
 		for o in group
 			if !isempty(bucket) && o.due - bucket[1].due > window
 				push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
-							 due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+							 due = bucket[1].due, weight = order_weight(g),
 							 n_combined = length(bucket)))
 				next_id += 1
 				empty!(bucket)
@@ -147,7 +191,7 @@ function consolidate_orders(customer_orders; window = 24.0)
 		end
 		if !isempty(bucket)
 			push!(lots, (id = next_id, grade = g, qty = sum(b.qty for b in bucket),
-						 due = bucket[1].due, weight = maximum(b.weight for b in bucket),
+						 due = bucket[1].due, weight = order_weight(g),
 						 n_combined = length(bucket)))
 			next_id += 1
 		end
@@ -194,19 +238,23 @@ explicit `(from, to) -> hours` table rather than a flat rule:
 
 push!(cells, NBCell("""
 const CHANGEOVER = Dict(
-	("HDPE-5502",    "HDPE-5502")    => 0.5,
-	("HDPE-5502",    "LLDPE-2020")   => 2.0,
-	("HDPE-5502",    "LDPE-1922")    => 3.5,
-	("LLDPE-2020",   "HDPE-5502")    => 2.5,
-	("LLDPE-2020",   "LLDPE-2020")   => 0.5,
-	("LLDPE-2020",   "LDPE-1922")    => 2.0,
-	("LDPE-1922",    "HDPE-5502")    => 3.0,
-	("LDPE-1922",    "LLDPE-2020")   => 2.5,
-	("LDPE-1922",    "LDPE-1922")    => 0.5,
-	("PP-Homo-1100", "PP-Homo-1100") => 0.5,
-	("PP-Homo-1100", "PP-Copo-3300") => 3.0,
-	("PP-Copo-3300", "PP-Homo-1100") => 2.0,
-	("PP-Copo-3300", "PP-Copo-3300") => 0.5,
+	("HDPE-5502",  "HDPE-5502")  => 0.5, ("HDPE-5502",  "HDPE-6200")  => 2.0,
+	("HDPE-5502",  "LLDPE-2020") => 3.0, ("HDPE-5502",  "LDPE-1922")  => 6.0,
+	("HDPE-6200",  "HDPE-5502")  => 2.5, ("HDPE-6200",  "HDPE-6200")  => 0.5,
+	("HDPE-6200",  "LLDPE-2020") => 3.5, ("HDPE-6200",  "LDPE-1922")  => 6.5,
+	("LLDPE-2020", "HDPE-5502")  => 3.5, ("LLDPE-2020", "HDPE-6200")  => 3.0,
+	("LLDPE-2020", "LLDPE-2020") => 0.5, ("LLDPE-2020", "LDPE-1922")  => 4.0,
+	("LDPE-1922",  "HDPE-5502")  => 5.0, ("LDPE-1922",  "HDPE-6200")  => 5.5,
+	("LDPE-1922",  "LLDPE-2020") => 4.5, ("LDPE-1922",  "LDPE-1922")  => 0.5,
+
+	("PP-Homo-1100",  "PP-Homo-1100")  => 0.5, ("PP-Homo-1100",  "PP-Homo-1305")  => 1.5,
+	("PP-Homo-1100",  "PP-Copo-3300")  => 3.0, ("PP-Homo-1100",  "PP-Impact-7015") => 4.0,
+	("PP-Homo-1305",  "PP-Homo-1100")  => 2.0, ("PP-Homo-1305",  "PP-Homo-1305")  => 0.5,
+	("PP-Homo-1305",  "PP-Copo-3300")  => 3.5, ("PP-Homo-1305",  "PP-Impact-7015") => 4.5,
+	("PP-Copo-3300",  "PP-Homo-1100")  => 2.5, ("PP-Copo-3300",  "PP-Homo-1305")  => 3.0,
+	("PP-Copo-3300",  "PP-Copo-3300")  => 0.5, ("PP-Copo-3300",  "PP-Impact-7015") => 3.0,
+	("PP-Impact-7015", "PP-Homo-1100")  => 3.5, ("PP-Impact-7015", "PP-Homo-1305")  => 4.0,
+	("PP-Impact-7015", "PP-Copo-3300")  => 2.5, ("PP-Impact-7015", "PP-Impact-7015") => 0.5,
 )
 changeover_time(gi::String, gj::String) = CHANGEOVER[(gi, gj)]
 """, true))
@@ -223,12 +271,12 @@ begin
 		)
 		Markdown.parse(join([header, sep, body], "\\n"))
 	end
-	changeover_matrix_md(["HDPE-5502", "LLDPE-2020", "LDPE-1922"])
+	changeover_matrix_md(["HDPE-5502", "HDPE-6200", "LLDPE-2020", "LDPE-1922"])
 end
 """, true))
 
 push!(cells, NBCell("""
-changeover_matrix_md(["PP-Homo-1100", "PP-Copo-3300"])
+changeover_matrix_md(["PP-Homo-1100", "PP-Homo-1305", "PP-Copo-3300", "PP-Impact-7015"])
 """, true))
 
 push!(cells, NBCell("""
@@ -362,8 +410,8 @@ begin
 	rows(res, os) = map(res.seq) do i
 		start_t = res.C[i] - res.pt[i]
 		(order = os[i].id, grade = os[i].grade, qty = os[i].qty,
-		 start = round(start_t, digits = 1), stop = round(res.C[i], digits = 1),
-		 due = os[i].due, tardy = round(res.T[i], digits = 1))
+		 start_day = round(start_t / 24, digits = 1), end_day = round(res.C[i] / 24, digits = 1),
+		 due_day = round(os[i].due / 24, digits = 1), tardy_days = round(res.T[i] / 24, digits = 1))
 	end
 	(PE = rows(pe_result, pe_orders), PP = rows(pp_result, pp_orders))
 end
@@ -380,31 +428,33 @@ begin
 	family_color = Dict(:PE => RGB(0.20, 0.45, 0.85), :PP => RGB(0.90, 0.55, 0.10))
 
 	gantt = plot(
-		size = (900, 380),
-		xlabel = "Time (h)",
+		size = (1000, 380),
+		xlabel = "Time (days)",
 		ylabel = "",
 		yticks = ([1, 2], ["PP train", "PE train"]),
+		xlims = (0, HORIZON_HOURS / 24),
 		ylims = (0, 3),
 		legend = :outertop,
 		legendcolumns = 2,
 		framestyle = :box,
-		title = "Two dedicated production trains (running in parallel)",
+		title = "Two dedicated production trains — 30-day horizon (running in parallel)",
 	)
 
 	local seen = Set{Symbol}()
 	for (res, os, ypos) in ((pe_result, pe_orders, 2), (pp_result, pp_orders, 1))
 		for i in res.seq
-			start_t = res.C[i] - res.pt[i]
+			start_d = (res.C[i] - res.pt[i]) / 24
+			end_d = res.C[i] / 24
 			fam = family[os[i].grade]
 			lbl = fam in seen ? "" : String(fam)
 			push!(seen, fam)
-			plot!(gantt, Shape([start_t, res.C[i], res.C[i], start_t],
+			plot!(gantt, Shape([start_d, end_d, end_d, start_d],
 								[ypos - 0.35, ypos - 0.35, ypos + 0.35, ypos + 0.35]),
 				  color = family_color[fam], linecolor = :black, label = lbl)
-			annotate!(gantt, (start_t + res.C[i]) / 2, ypos,
-					  text(string(os[i].grade, "\\n#", os[i].id), 7, :white, :center))
+			annotate!(gantt, (start_d + end_d) / 2, ypos,
+					  text(string(os[i].grade, "\\n#", os[i].id), 6, :white, :center))
 			due_color = res.T[i] > 1e-6 ? :red : :black
-			scatter!(gantt, [os[i].due], [ypos + 0.42], marker = :dtriangle, markersize = 6,
+			scatter!(gantt, [os[i].due / 24], [ypos + 0.42], marker = :dtriangle, markersize = 6,
 					 color = due_color, label = "")
 		end
 	end
@@ -437,16 +487,18 @@ begin
 	total_tardy_h = sum(pe_result.T) + sum(pp_result.T)
 	n_tardy_orders = count(>(1e-6), vcat(pe_result.T, pp_result.T))
 	total_cost = pe_result.cost + pp_result.cost
+	horizon_slack_days = (HORIZON_HOURS - overall_makespan) / 24
 
 	kpi_text = string(
 		"| KPI | PE train | PP train | Overall |\\n",
 		"|---|---|---|---|\\n",
-		"| Makespan (h) | ", @sprintf("%.1f", makespan_pe), " | ", @sprintf("%.1f", makespan_pp),
-		" | ", @sprintf("%.1f", overall_makespan), " |\\n",
+		"| Makespan (days) | ", @sprintf("%.1f", makespan_pe / 24), " | ", @sprintf("%.1f", makespan_pp / 24),
+		" | ", @sprintf("%.1f", overall_makespan / 24), " |\\n",
 		"| Cost (\\\$) | ", @sprintf("%.0f", pe_result.cost), " | ", @sprintf("%.0f", pp_result.cost),
 		" | ", @sprintf("%.0f", total_cost), " |\\n",
 		"| Tardy orders | | | ", n_tardy_orders, " of ", length(orders), " |\\n",
-		"| Total tardiness (h) | | | ", @sprintf("%.1f", total_tardy_h), " |\\n",
+		"| Total tardiness (days) | | | ", @sprintf("%.1f", total_tardy_h / 24), " |\\n",
+		"| Slack vs. 30-day horizon | | | ", @sprintf("%.1f", horizon_slack_days), " days |\\n",
 	)
 	Markdown.parse(kpi_text)
 end

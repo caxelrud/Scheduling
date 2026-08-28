@@ -10,10 +10,13 @@ optimization.
 ### 1. Polymer plant scheduling (PE / PP campaigns)
 
 `notebooks/polymer_pe_pp_scheduling.jl` — a Pluto notebook that schedules a
-polymer plant's **two dedicated production trains**: one for polyethylene
-(PE) grades, one for polypropylene (PP) grades. PE and PP use different
-reactor/catalyst technology, so they never share a line — the notebook
-solves two independent single-line MILPs (one per train) in parallel.
+**month-long (30-day, 720-hour) production schedule** for a polymer plant's
+**two dedicated production trains**: one for 4 polyethylene (PE) grades, one
+for 4 polypropylene (PP) grades. PE and PP use different reactor/catalyst
+technology, so they never share a line — the notebook solves two independent
+single-line MILPs (one per train) in parallel, each grade running a
+multi-day campaign with changeovers taking a few hours, the scale real
+plant schedulers actually work at.
 
 Raw customer orders (many small, separately-negotiated quantities per
 grade) are first **consolidated**: same-grade orders due within a
