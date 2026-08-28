@@ -48,9 +48,26 @@ n = length(orders)
 pe_orders = filter(o -> family[o.grade] == :PE, orders)
 pp_orders = filter(o -> family[o.grade] == :PP, orders)
 
-# Changeover time (hours) within a train: only ever between grades of the
-# SAME family, since PE and PP never share equipment.
-changeover_time(gi::String, gj::String) = gi == gj ? 0.5 : 2.5
+# Changeover time (hours) within a train: an explicit grade-to-grade matrix
+# (often asymmetric -- purging to a lighter/cleaner grade is faster than the
+# reverse). Only pairs within the same family are ever needed since PE and
+# PP never share equipment.
+const CHANGEOVER = Dict(
+    ("HDPE-5502",    "HDPE-5502")    => 0.5,
+    ("HDPE-5502",    "LLDPE-2020")   => 2.0,
+    ("HDPE-5502",    "LDPE-1922")    => 3.5,
+    ("LLDPE-2020",   "HDPE-5502")    => 2.5,
+    ("LLDPE-2020",   "LLDPE-2020")   => 0.5,
+    ("LLDPE-2020",   "LDPE-1922")    => 2.0,
+    ("LDPE-1922",    "HDPE-5502")    => 3.0,
+    ("LDPE-1922",    "LLDPE-2020")   => 2.5,
+    ("LDPE-1922",    "LDPE-1922")    => 0.5,
+    ("PP-Homo-1100", "PP-Homo-1100") => 0.5,
+    ("PP-Homo-1100", "PP-Copo-3300") => 3.0,
+    ("PP-Copo-3300", "PP-Homo-1100") => 2.0,
+    ("PP-Copo-3300", "PP-Copo-3300") => 0.5,
+)
+changeover_time(gi::String, gj::String) = CHANGEOVER[(gi, gj)]
 startup_time = 1.0
 
 changeover_cost_per_hour = 450.0
@@ -189,6 +206,17 @@ function rows_for(res, os, train_label)
 end
 rows_html = rows_for(pe, pe_orders, "PE") * rows_for(pp, pp_orders, "PP")
 
+function changeover_matrix_html(grades)
+    header = "<tr><th>from \\ to</th>" * join("<th>$g</th>" for g in grades) * "</tr>"
+    body = join(
+        "<tr><th>$g1</th>" * join("<td>$(CHANGEOVER[(g1, g2)])</td>" for g2 in grades) * "</tr>"
+        for g1 in grades
+    )
+    "<table>\n<thead>$header</thead>\n<tbody>$body</tbody>\n</table>"
+end
+pe_matrix_html = changeover_matrix_html(["HDPE-5502", "LLDPE-2020", "LDPE-1922"])
+pp_matrix_html = changeover_matrix_html(["PP-Homo-1100", "PP-Copo-3300"])
+
 # ---------------------------------------------------------------------------
 # 5. Assemble the self-contained HTML report
 # ---------------------------------------------------------------------------
@@ -287,15 +315,17 @@ $(join(["<tr><td>$(o.id)</td><td>$(o.grade)</td><td>$(String(family[o.grade]))</
 <h2>2. Sequence-dependent changeovers (within a train)</h2>
 <p>
 Because a train only ever runs grades from one family, the only changeover
-decision is <em>within</em> that family:
+decision is <em>within</em> that family. Real purge/transition times depend
+on the <strong>specific grade pair</strong>, not just "same grade or not" —
+and they are often <strong>asymmetric</strong>: moving to a lighter color
+or lower-additive grade purges faster than the reverse, because residual
+material from the <em>previous</em> grade is what has to be flushed out.
+Hours shown are <code>from</code> (row) &rarr; <code>to</code> (column):
 </p>
-<table>
-<thead><tr><th>Transition</th><th>Time (h)</th><th>Why</th></tr></thead>
-<tbody>
-<tr><td>Same grade repeated</td><td>0.5</td><td>housekeeping only</td></tr>
-<tr><td>Different grade, same family</td><td>2.5</td><td>color/additive change, partial purge</td></tr>
-</tbody>
-</table>
+<h3>PE train</h3>
+$(pe_matrix_html)
+<h3>PP train</h3>
+$(pp_matrix_html)
 <p class="note">
 There is no PE&harr;PP transition to model — that changeover never happens,
 because it would require re-equipping the whole train.
@@ -374,7 +404,7 @@ version:
 <ul>
   <li><strong>More than one train per family</strong> — e.g. two PE lines with different capability sets; extend the model to a proper parallel-machine assignment problem within a family.</li>
   <li><strong>Minimum/maximum campaign length</strong> — avoid uneconomically short runs by bounding the number of consecutive orders of the same grade.</li>
-  <li><strong>Exact grade-pair changeover matrix</strong> — replace the flat "0.5 / 2.5 h" rule with real historical purge times per ordered grade pair.</li>
+  <li><strong>Data-driven changeover matrix</strong> — populate the grade-pair matrix from real historical purge-time records (e.g. a CSV export from the plant historian) instead of hand-entered estimates.</li>
   <li><strong>Shared upstream/downstream utilities</strong> — if both trains draw from a common feedstock or packaging line, that shared resource needs its own capacity constraint linking the two schedules.</li>
   <li><strong>Rolling-horizon re-optimization</strong> — re-solve as new orders arrive or priorities change, warm-starting from the current sequence.</li>
   <li><strong>Robustness</strong> — sample uncertain processing rates / late raw-material arrivals and re-optimize, or solve a chance-constrained variant.</li>

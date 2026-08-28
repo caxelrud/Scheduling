@@ -14,7 +14,7 @@ macro bind(def, element)
     end
 end
 
-# ╔═╡ df258010-71ec-4928-8a46-8482ef7d1525
+# ╔═╡ 636888a9-4816-47d5-805c-9a6adb46ed1b
 md"""
 # Polymer Plant Scheduling — Dedicated PE & PP Production Trains
 
@@ -42,7 +42,7 @@ the optimal campaign sequence on each train reacts to the relative cost of
 changeovers versus lateness.
 """
 
-# ╔═╡ 6225aef8-4a89-4006-99cf-ff9ac3c1c028
+# ╔═╡ 4107a004-ebc2-4096-8332-f7b6860851ba
 begin
 	using JuMP
 	using HiGHS
@@ -51,10 +51,10 @@ begin
 	using Printf
 end
 
-# ╔═╡ 72806869-6577-49bf-86e4-5f31e2ef8ca7
+# ╔═╡ 0c3b1ca4-b445-4ba6-8330-0887fa975892
 TableOfContents(title = "Polymer Scheduling")
 
-# ╔═╡ 7678bf72-c7d5-48e7-8355-d757c47d0bc0
+# ╔═╡ 3f3d2d43-55b7-43b8-a01e-81bda66e27b9
 md"""
 ## 1. Plant data: grades, families, and orders
 
@@ -65,7 +65,7 @@ quantity, a production rate on its train, and a customer due date (in
 hours from the scheduling horizon start, `t = 0`).
 """
 
-# ╔═╡ 7add94a5-5e17-4a50-88ae-3e85be9af9be
+# ╔═╡ 104b339b-70ca-406a-a69a-0fd3bc2d427e
 family = Dict(
 	"HDPE-5502"    => :PE,
 	"LLDPE-2020"   => :PE,
@@ -74,7 +74,7 @@ family = Dict(
 	"PP-Copo-3300" => :PP,
 )
 
-# ╔═╡ 1a48955d-fa52-4aa9-8479-8c8cb72dbecf
+# ╔═╡ 439e0a9a-67b1-4c14-ab92-fb0a9cbe6b05
 production_rate = Dict( # tons / hour, on that grade's dedicated train
 	"HDPE-5502"    => 5.0,
 	"LLDPE-2020"   => 4.5,
@@ -83,7 +83,7 @@ production_rate = Dict( # tons / hour, on that grade's dedicated train
 	"PP-Copo-3300" => 4.8,
 )
 
-# ╔═╡ ee959939-10d7-4e47-bf81-91149ba80168
+# ╔═╡ af1a8ac5-20b2-4d22-9866-a81b02c19315
 orders = [
 	(id = 1, grade = "HDPE-5502",    qty = 120.0, due = 30.0,  weight = 1.0),
 	(id = 2, grade = "LLDPE-2020",   qty = 80.0,  due = 40.0,  weight = 1.0),
@@ -94,38 +94,74 @@ orders = [
 	(id = 7, grade = "PP-Homo-1100", qty = 110.0, due = 110.0, weight = 1.5),
 ];
 
-# ╔═╡ 1cf78fb2-edc2-40c0-958f-2f671cdf261c
+# ╔═╡ 619b9040-2f0c-4269-883f-542806c19274
 begin
 	pe_orders = filter(o -> family[o.grade] == :PE, orders)
 	pp_orders = filter(o -> family[o.grade] == :PP, orders)
 	(pe = length(pe_orders), pp = length(pp_orders))
 end
 
-# ╔═╡ d990b93f-ccf5-43db-9744-a72f9d7754cc
+# ╔═╡ 50fa1b02-40e4-4d90-b6c0-aa35876e7d3c
 md"""
 ## 2. Sequence-dependent changeovers (within a train)
 
 Because a train only ever runs grades from one family, the only changeover
-decision is *within* that family:
+decision is *within* that family. Real purge/transition times depend on the
+**specific grade pair**, not just "same grade or not" — and they are often
+**asymmetric**: moving to a lighter color or lower-additive grade purges
+faster than the reverse, because residual material from the *previous*
+grade is what has to be flushed out. So changeovers are given as an
+explicit `(from, to) -> hours` table rather than a flat rule:
+"""
 
-| Transition | Time (h) | Why |
-|---|---|---|
-| Same grade repeated | 0.5 | housekeeping only |
-| Different grade, same family | 2.5 | color/additive change, partial purge |
+# ╔═╡ f8ce68cc-f280-4a76-b1ae-c011a18394ea
+const CHANGEOVER = Dict(
+	("HDPE-5502",    "HDPE-5502")    => 0.5,
+	("HDPE-5502",    "LLDPE-2020")   => 2.0,
+	("HDPE-5502",    "LDPE-1922")    => 3.5,
+	("LLDPE-2020",   "HDPE-5502")    => 2.5,
+	("LLDPE-2020",   "LLDPE-2020")   => 0.5,
+	("LLDPE-2020",   "LDPE-1922")    => 2.0,
+	("LDPE-1922",    "HDPE-5502")    => 3.0,
+	("LDPE-1922",    "LLDPE-2020")   => 2.5,
+	("LDPE-1922",    "LDPE-1922")    => 0.5,
+	("PP-Homo-1100", "PP-Homo-1100") => 0.5,
+	("PP-Homo-1100", "PP-Copo-3300") => 3.0,
+	("PP-Copo-3300", "PP-Homo-1100") => 2.0,
+	("PP-Copo-3300", "PP-Copo-3300") => 0.5,
+)
+changeover_time(gi::String, gj::String) = CHANGEOVER[(gi, gj)]
 
+# ╔═╡ d9184e81-c3cc-466c-bc8b-c4f3a1d035a4
+begin
+	function changeover_matrix_md(grades)
+		header = "| from \\ to | " * join(grades, " | ") * " |"
+		sep = "|---" ^ (length(grades) + 1) * "|"
+		body = join(
+			["| **$g1** | " * join([string(CHANGEOVER[(g1, g2)]) for g2 in grades], " | ") * " |"
+			 for g1 in grades],
+			"\n",
+		)
+		Markdown.parse(join([header, sep, body], "\n"))
+	end
+	changeover_matrix_md(["HDPE-5502", "LLDPE-2020", "LDPE-1922"])
+end
+
+# ╔═╡ 63d326db-8036-4bf1-b1f9-efc0905b7077
+changeover_matrix_md(["PP-Homo-1100", "PP-Copo-3300"])
+
+# ╔═╡ 020024d4-a525-479b-814d-681064fff68c
+md"""
 There is no PE ↔ PP transition to model — that changeover never happens,
 because it would require re-equipping the whole train. Use the sliders to
 explore how the relative cost of a changeover-hour vs. a tardy-hour
 reshapes each train's optimal campaign order.
 """
 
-# ╔═╡ be2b9d28-bec6-49c6-ab64-c92278d59ed9
-begin
-	changeover_time(gi::String, gj::String) = gi == gj ? 0.5 : 2.5
-	startup_time = 1.0 # train idle -> first grade of the campaign
-end
+# ╔═╡ 145f722a-4ae2-4333-ad78-217a2a600297
+startup_time = 1.0 # train idle -> first grade of the campaign
 
-# ╔═╡ 415c7a6b-5313-4b53-b432-c84fa2005c3d
+# ╔═╡ 2cfdd195-2c97-472b-91fe-074047cb7d69
 md"""
 Changeover cost rate (\$ / hour of line time lost to purging & transition material):
 
@@ -136,7 +172,7 @@ Tardiness cost rate (\$ / hour late, per unit of order weight):
 $(@bind tardiness_cost_per_hour Slider(50:25:600, default = 300, show_value = true))
 """
 
-# ╔═╡ 23da1031-c95a-4384-97c8-50e7230de759
+# ╔═╡ 170e1a62-9142-418e-946b-80aa6f14b253
 md"""
 ## 3. MILP formulation (applied once per train)
 
@@ -165,7 +201,7 @@ open path. The two trains' sub-problems share no variables, so solving them
 independently is exact, not a heuristic decomposition.
 """
 
-# ╔═╡ 81466059-6824-4f06-8da9-13f1302eb802
+# ╔═╡ 65f8c104-36dc-46b2-8772-bc5ff0130c18
 function schedule_line(line_orders, changeover_cost_per_hour, tardiness_cost_per_hour)
 	m = length(line_orders)
 	pt = [o.qty / production_rate[o.grade] for o in line_orders]
@@ -221,18 +257,18 @@ function schedule_line(line_orders, changeover_cost_per_hour, tardiness_cost_per
 	 status = termination_status(model))
 end
 
-# ╔═╡ 99e38aae-e919-48b3-bd41-43ce368053e8
+# ╔═╡ 5aef4e56-851e-483c-aa39-0bae2cda868a
 pe_result = schedule_line(pe_orders, changeover_cost_per_hour, tardiness_cost_per_hour)
 
-# ╔═╡ 7b01ab26-ea96-449f-b517-5675adfe7011
+# ╔═╡ 8f4450de-dad6-4728-9161-821c33a7cb63
 pp_result = schedule_line(pp_orders, changeover_cost_per_hour, tardiness_cost_per_hour)
 
-# ╔═╡ 4ba802ba-5f66-4c2b-a191-9bc43666754b
+# ╔═╡ 7c739c33-bff1-441e-9eb8-26d5957ef8a3
 md"""
 ## 4. Optimal campaign sequence, per train
 """
 
-# ╔═╡ 35cabed3-56fd-42cc-bd37-4c8e731648ff
+# ╔═╡ e4995c67-0b2e-455e-bc9b-3ee4128e9150
 begin
 	rows(res, os) = map(res.seq) do i
 		start_t = res.C[i] - res.pt[i]
@@ -243,12 +279,12 @@ begin
 	(PE = rows(pe_result, pe_orders), PP = rows(pp_result, pp_orders))
 end
 
-# ╔═╡ 249ec8dd-e16a-4090-b643-c6112014a9b4
+# ╔═╡ 63e5e8b8-7c4d-4410-88ce-cfeec654828e
 md"""
 ## 5. Gantt chart
 """
 
-# ╔═╡ 87b34a62-0dbe-4180-a68c-fae36891719a
+# ╔═╡ cd389a3d-5dda-4dd1-afa2-4cd1895a2262
 begin
 	family_color = Dict(:PE => RGB(0.20, 0.45, 0.85), :PP => RGB(0.90, 0.55, 0.10))
 
@@ -285,7 +321,7 @@ begin
 	gantt
 end
 
-# ╔═╡ 63a12b3c-c242-4f6b-b789-7e4c7bb7d864
+# ╔═╡ 5467b9c4-83f5-4666-a3bf-425b51d399a3
 md"""
 Grade blocks are colored by polymer family (PE vs. PP); triangles mark each
 order's due date (red = missed). Because the two trains never compete for
@@ -294,12 +330,12 @@ the same equipment, they run **simultaneously**: overall makespan is the
 this as one shared line that has to purge between families.
 """
 
-# ╔═╡ ee0df96d-1d12-4962-9315-5221880a7662
+# ╔═╡ 070a6da7-8c4a-48f6-b129-b5b729e2d5a2
 md"""
 ## 6. Key performance indicators
 """
 
-# ╔═╡ 98de6dbf-c63d-4cbf-b730-2c56d9690987
+# ╔═╡ bb5f2e39-6439-42b9-84a2-50c755908146
 begin
 	makespan_pe = maximum(pe_result.C)
 	makespan_pp = maximum(pp_result.C)
@@ -321,7 +357,7 @@ begin
 	Markdown.parse(kpi_text)
 end
 
-# ╔═╡ d69ba5c4-e4f3-4a38-b033-6e2a948a83f7
+# ╔═╡ f3801aa6-802b-41cf-96ac-9a51554318eb
 md"""
 ## 7. Discussion & extensions
 
@@ -340,8 +376,8 @@ Natural next steps for a production-grade version:
   assignment problem within a family.
 - **Minimum/maximum campaign length** — avoid uneconomically short runs by
   bounding the number of consecutive orders of the same grade.
-- **Exact grade-pair changeover matrix** — replace the flat "0.5 / 2.5 h"
-  rule with real historical purge times per ordered grade pair.
+- **Data-driven changeover matrix** — populate the grade-pair matrix from
+  real historical purge-time records instead of hand-entered estimates.
 - **Shared upstream/downstream utilities** — if both trains draw from a
   common feedstock or packaging line, that shared resource needs its own
   capacity constraint linking the two schedules.
@@ -355,26 +391,30 @@ the above are incremental changes to `schedule_line`, not a rewrite.
 """
 
 # ╔═╡ Cell order:
-# ╟─df258010-71ec-4928-8a46-8482ef7d1525
-# ╠═6225aef8-4a89-4006-99cf-ff9ac3c1c028
-# ╠═72806869-6577-49bf-86e4-5f31e2ef8ca7
-# ╟─7678bf72-c7d5-48e7-8355-d757c47d0bc0
-# ╠═7add94a5-5e17-4a50-88ae-3e85be9af9be
-# ╠═1a48955d-fa52-4aa9-8479-8c8cb72dbecf
-# ╠═ee959939-10d7-4e47-bf81-91149ba80168
-# ╠═1cf78fb2-edc2-40c0-958f-2f671cdf261c
-# ╟─d990b93f-ccf5-43db-9744-a72f9d7754cc
-# ╠═be2b9d28-bec6-49c6-ab64-c92278d59ed9
-# ╟─415c7a6b-5313-4b53-b432-c84fa2005c3d
-# ╟─23da1031-c95a-4384-97c8-50e7230de759
-# ╠═81466059-6824-4f06-8da9-13f1302eb802
-# ╠═99e38aae-e919-48b3-bd41-43ce368053e8
-# ╠═7b01ab26-ea96-449f-b517-5675adfe7011
-# ╟─4ba802ba-5f66-4c2b-a191-9bc43666754b
-# ╠═35cabed3-56fd-42cc-bd37-4c8e731648ff
-# ╟─249ec8dd-e16a-4090-b643-c6112014a9b4
-# ╠═87b34a62-0dbe-4180-a68c-fae36891719a
-# ╟─63a12b3c-c242-4f6b-b789-7e4c7bb7d864
-# ╟─ee0df96d-1d12-4962-9315-5221880a7662
-# ╠═98de6dbf-c63d-4cbf-b730-2c56d9690987
-# ╟─d69ba5c4-e4f3-4a38-b033-6e2a948a83f7
+# ╟─636888a9-4816-47d5-805c-9a6adb46ed1b
+# ╠═4107a004-ebc2-4096-8332-f7b6860851ba
+# ╠═0c3b1ca4-b445-4ba6-8330-0887fa975892
+# ╟─3f3d2d43-55b7-43b8-a01e-81bda66e27b9
+# ╠═104b339b-70ca-406a-a69a-0fd3bc2d427e
+# ╠═439e0a9a-67b1-4c14-ab92-fb0a9cbe6b05
+# ╠═af1a8ac5-20b2-4d22-9866-a81b02c19315
+# ╠═619b9040-2f0c-4269-883f-542806c19274
+# ╟─50fa1b02-40e4-4d90-b6c0-aa35876e7d3c
+# ╠═f8ce68cc-f280-4a76-b1ae-c011a18394ea
+# ╠═d9184e81-c3cc-466c-bc8b-c4f3a1d035a4
+# ╠═63d326db-8036-4bf1-b1f9-efc0905b7077
+# ╟─020024d4-a525-479b-814d-681064fff68c
+# ╠═145f722a-4ae2-4333-ad78-217a2a600297
+# ╟─2cfdd195-2c97-472b-91fe-074047cb7d69
+# ╟─170e1a62-9142-418e-946b-80aa6f14b253
+# ╠═65f8c104-36dc-46b2-8772-bc5ff0130c18
+# ╠═5aef4e56-851e-483c-aa39-0bae2cda868a
+# ╠═8f4450de-dad6-4728-9161-821c33a7cb63
+# ╟─7c739c33-bff1-441e-9eb8-26d5957ef8a3
+# ╠═e4995c67-0b2e-455e-bc9b-3ee4128e9150
+# ╟─63e5e8b8-7c4d-4410-88ce-cfeec654828e
+# ╠═cd389a3d-5dda-4dd1-afa2-4cd1895a2262
+# ╟─5467b9c4-83f5-4666-a3bf-425b51d399a3
+# ╟─070a6da7-8c4a-48f6-b129-b5b729e2d5a2
+# ╠═bb5f2e39-6439-42b9-84a2-50c755908146
+# ╟─f3801aa6-802b-41cf-96ac-9a51554318eb

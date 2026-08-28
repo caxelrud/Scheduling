@@ -41,11 +41,28 @@ production_rate = Dict( # tons/hour, on that grade's dedicated line
     "PP-Copo-3300" => 4.8,
 )
 
-# Changeover time (hours) within a line: only ever between grades of the
-# SAME family, since PE and PP never share equipment.
-#   same grade repeated -> 0.5 h (housekeeping only)
-#   different grade      -> 2.5 h (color/additive change, partial purge)
-changeover_time(gi::String, gj::String) = gi == gj ? 0.5 : 2.5
+# Changeover time (hours) within a line: an explicit grade-to-grade matrix,
+# since real purge/transition times depend on the specific pair, not just
+# "same family or not" -- and they are often ASYMMETRIC (e.g. going to a
+# lighter color or lower-additive grade purges faster than the reverse).
+# Only pairs within the same family are ever needed since PE and PP never
+# share equipment.
+const CHANGEOVER = Dict(
+    ("HDPE-5502",    "HDPE-5502")    => 0.5,
+    ("HDPE-5502",    "LLDPE-2020")   => 2.0,
+    ("HDPE-5502",    "LDPE-1922")    => 3.5,
+    ("LLDPE-2020",   "HDPE-5502")    => 2.5,
+    ("LLDPE-2020",   "LLDPE-2020")   => 0.5,
+    ("LLDPE-2020",   "LDPE-1922")    => 2.0,
+    ("LDPE-1922",    "HDPE-5502")    => 3.0,
+    ("LDPE-1922",    "LLDPE-2020")   => 2.5,
+    ("LDPE-1922",    "LDPE-1922")    => 0.5,
+    ("PP-Homo-1100", "PP-Homo-1100") => 0.5,
+    ("PP-Homo-1100", "PP-Copo-3300") => 3.0,
+    ("PP-Copo-3300", "PP-Homo-1100") => 2.0,
+    ("PP-Copo-3300", "PP-Copo-3300") => 0.5,
+)
+changeover_time(gi::String, gj::String) = CHANGEOVER[(gi, gj)]
 
 startup_time = 1.0 # line idle -> first grade of the campaign
 

@@ -111,13 +111,56 @@ md\"\"\"
 ## 2. Sequence-dependent changeovers (within a train)
 
 Because a train only ever runs grades from one family, the only changeover
-decision is *within* that family:
+decision is *within* that family. Real purge/transition times depend on the
+**specific grade pair**, not just "same grade or not" — and they are often
+**asymmetric**: moving to a lighter color or lower-additive grade purges
+faster than the reverse, because residual material from the *previous*
+grade is what has to be flushed out. So changeovers are given as an
+explicit `(from, to) -> hours` table rather than a flat rule:
+\"\"\"
+""", false))
 
-| Transition | Time (h) | Why |
-|---|---|---|
-| Same grade repeated | 0.5 | housekeeping only |
-| Different grade, same family | 2.5 | color/additive change, partial purge |
+push!(cells, NBCell("""
+const CHANGEOVER = Dict(
+	("HDPE-5502",    "HDPE-5502")    => 0.5,
+	("HDPE-5502",    "LLDPE-2020")   => 2.0,
+	("HDPE-5502",    "LDPE-1922")    => 3.5,
+	("LLDPE-2020",   "HDPE-5502")    => 2.5,
+	("LLDPE-2020",   "LLDPE-2020")   => 0.5,
+	("LLDPE-2020",   "LDPE-1922")    => 2.0,
+	("LDPE-1922",    "HDPE-5502")    => 3.0,
+	("LDPE-1922",    "LLDPE-2020")   => 2.5,
+	("LDPE-1922",    "LDPE-1922")    => 0.5,
+	("PP-Homo-1100", "PP-Homo-1100") => 0.5,
+	("PP-Homo-1100", "PP-Copo-3300") => 3.0,
+	("PP-Copo-3300", "PP-Homo-1100") => 2.0,
+	("PP-Copo-3300", "PP-Copo-3300") => 0.5,
+)
+changeover_time(gi::String, gj::String) = CHANGEOVER[(gi, gj)]
+""", true))
 
+push!(cells, NBCell("""
+begin
+	function changeover_matrix_md(grades)
+		header = "| from \\\\ to | " * join(grades, " | ") * " |"
+		sep = "|---" ^ (length(grades) + 1) * "|"
+		body = join(
+			["| **\$g1** | " * join([string(CHANGEOVER[(g1, g2)]) for g2 in grades], " | ") * " |"
+			 for g1 in grades],
+			"\\n",
+		)
+		Markdown.parse(join([header, sep, body], "\\n"))
+	end
+	changeover_matrix_md(["HDPE-5502", "LLDPE-2020", "LDPE-1922"])
+end
+""", true))
+
+push!(cells, NBCell("""
+changeover_matrix_md(["PP-Homo-1100", "PP-Copo-3300"])
+""", true))
+
+push!(cells, NBCell("""
+md\"\"\"
 There is no PE ↔ PP transition to model — that changeover never happens,
 because it would require re-equipping the whole train. Use the sliders to
 explore how the relative cost of a changeover-hour vs. a tardy-hour
@@ -126,10 +169,7 @@ reshapes each train's optimal campaign order.
 """, false))
 
 push!(cells, NBCell("""
-begin
-	changeover_time(gi::String, gj::String) = gi == gj ? 0.5 : 2.5
-	startup_time = 1.0 # train idle -> first grade of the campaign
-end
+startup_time = 1.0 # train idle -> first grade of the campaign
 """, true))
 
 push!(cells, NBCell("""
@@ -359,8 +399,8 @@ Natural next steps for a production-grade version:
   assignment problem within a family.
 - **Minimum/maximum campaign length** — avoid uneconomically short runs by
   bounding the number of consecutive orders of the same grade.
-- **Exact grade-pair changeover matrix** — replace the flat "0.5 / 2.5 h"
-  rule with real historical purge times per ordered grade pair.
+- **Data-driven changeover matrix** — populate the grade-pair matrix from
+  real historical purge-time records instead of hand-entered estimates.
 - **Shared upstream/downstream utilities** — if both trains draw from a
   common feedstock or packaging line, that shared resource needs its own
   capacity constraint linking the two schedules.
